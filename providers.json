@@ -1,0 +1,99 @@
+{
+  "providers": {
+    "copilot": {
+      "name": "GitHub Copilot CLI",
+      "binary": "gh",
+      "subcommand": ["copilot"],
+      "plan_args": ["-p", "{prompt}"],
+      "implement_args": ["-p", "{prompt}", "--yolo"],
+      "security_args": ["-p", "{prompt}"],
+      "plan_timeout": 900,
+      "implement_timeout": 600,
+      "security_timeout": 300,
+      "env": {},
+      "notes": "Default provider. Uses `gh copilot` wrapper. Requires `gh` CLI with copilot extension."
+    },
+    "copilot-direct": {
+      "name": "GitHub Copilot CLI (Direct)",
+      "binary": "copilot",
+      "subcommand": [],
+      "plan_args": ["-p", "{prompt}"],
+      "implement_args": ["-p", "{prompt}", "--yolo"],
+      "security_args": ["-p", "{prompt}"],
+      "plan_timeout": 900,
+      "implement_timeout": 600,
+      "security_timeout": 300,
+      "env": {},
+      "notes": "Direct copilot binary without gh wrapper."
+    },
+    "claude": {
+      "name": "Claude Code",
+      "binary": "claude",
+      "subcommand": [],
+      "plan_args": ["-p", "{prompt}", "--output-format", "text"],
+      "implement_args": ["-p", "{prompt}", "--dangerouslySkipPermissions"],
+      "security_args": ["-p", "{prompt}", "--output-format", "text"],
+      "plan_timeout": 900,
+      "implement_timeout": 600,
+      "security_timeout": 300,
+      "env": {},
+      "notes": "Anthropic Claude Code CLI. Requires `claude` binary and ANTHROPIC_API_KEY."
+    },
+    "aider": {
+      "name": "Aider",
+      "binary": "aider",
+      "subcommand": [],
+      "plan_args": ["--message", "{prompt}", "--yes", "--no-auto-commits", "--dry-run"],
+      "implement_args": ["--message", "{prompt}", "--yes", "--no-auto-commits"],
+      "security_args": ["--message", "{prompt}", "--yes", "--no-auto-commits", "--dry-run"],
+      "plan_timeout": 900,
+      "implement_timeout": 600,
+      "security_timeout": 300,
+      "env": {},
+      "notes": "Aider AI pair programmer. Requires aider-chat pip package and an LLM API key."
+    },
+    "codex": {
+      "name": "OpenAI Codex CLI",
+      "binary": "codex",
+      "subcommand": [],
+      "plan_args": ["-p", "{prompt}"],
+      "implement_args": ["-p", "{prompt}", "--full-auto"],
+      "security_args": ["-p", "{prompt}"],
+      "plan_timeout": 900,
+      "implement_timeout": 600,
+      "security_timeout": 300,
+      "env": {},
+      "notes": "OpenAI Codex CLI. Requires OPENAI_API_KEY."
+    },
+    "gemini": {
+      "name": "Google Gemini CLI",
+      "binary": "gemini",
+      "subcommand": [],
+      "plan_args": ["-p", "{prompt}"],
+      "implement_args": ["-p", "{prompt}", "--sandbox"],
+      "security_args": ["-p", "{prompt}"],
+      "plan_timeout": 900,
+      "implement_timeout": 600,
+      "security_timeout": 300,
+      "env": {},
+      "notes": "Google Gemini CLI. Requires GOOGLE_API_KEY."
+    },
+    "amazon-q": {
+      "name": "Amazon Q Developer CLI",
+      "binary": "q",
+      "subcommand": ["chat"],
+      "plan_args": ["--prompt", "{prompt}"],
+      "implement_args": ["--prompt", "{prompt}", "--trust-all-tools"],
+      "security_args": ["--prompt", "{prompt}"],
+      "plan_timeout": 900,
+      "implement_timeout": 600,
+      "security_timeout": 300,
+      "env": {},
+      "notes": "Amazon Q Developer CLI. Requires AWS credentials."
+    }
+  },
+  "default_provider": "copilot",
+  "default_planning_provider": null,
+  "default_implement_provider": null,
+  "default_security_provider": null
+}

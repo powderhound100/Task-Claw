@@ -1,0 +1,7 @@
+.env
+agent-state.json
+agent.log
+research-output/
+security-reviews/
+__pycache__/
+*.pyc
