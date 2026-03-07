@@ -235,6 +235,15 @@ def load_pipeline() -> dict:
         return _PIPELINE_DEFAULT
 
 
+def _clean_env() -> dict:
+    """Return a copy of os.environ without vars that block nested CLI sessions."""
+    env = dict(os.environ)
+    # Claude Code refuses to launch inside another Claude Code session
+    for key in ("CLAUDECODE", "CLAUDE_CODE_SESSION"):
+        env.pop(key, None)
+    return env
+
+
 def run_cli_command(provider: dict, phase: str, prompt: str,
                     cwd: str | None = None) -> tuple[bool, str]:
     """Run a CLI provider command. Returns (success, output_text)."""
@@ -251,6 +260,7 @@ def run_cli_command(provider: dict, phase: str, prompt: str,
         result = subprocess.run(
             cmd, cwd=work_dir,
             capture_output=True, text=True, timeout=timeout,
+            env=_clean_env(), encoding="utf-8", errors="replace",
         )
         log.info("   Exit code: %d", result.returncode)
         if result.stdout:
@@ -959,6 +969,7 @@ def run_research(idea_id: str, title: str, description: str):
         result = subprocess.run(
             cmd, cwd=str(PROJECT_DIR),
             capture_output=True, text=True, timeout=timeout,
+            env=_clean_env(), encoding="utf-8", errors="replace",
         )
         text = (output_file.read_text(encoding="utf-8") if output_file.exists()
                 else result.stdout.strip() if result.stdout else None)
@@ -1054,8 +1065,9 @@ def run_security_review(task_id: str, title: str) -> dict:
         diff_text = ""
         for diff_cmd in [["git", "diff", "--cached"], ["git", "diff"]]:
             r = subprocess.run(diff_cmd, cwd=str(PROJECT_DIR),
-                               capture_output=True, text=True, timeout=30)
-            if r.stdout.strip():
+                               capture_output=True, text=True, timeout=30,
+                               encoding="utf-8", errors="replace")
+            if r.stdout and r.stdout.strip():
                 diff_text = r.stdout.strip()
                 break
         if not diff_text:
@@ -1091,7 +1103,8 @@ def run_security_review(task_id: str, title: str) -> dict:
         timeout = get_timeout(provider, "security")
 
         result = subprocess.run(cmd, cwd=str(PROJECT_DIR),
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, timeout=timeout,
+                                env=_clean_env(), encoding="utf-8", errors="replace")
 
         log.info("🔒 Security review exit code: %d", result.returncode)
         output = result.stdout.strip() if result.stdout else ""
@@ -1196,7 +1209,8 @@ def _handle_security_findings(review: dict, task_id: str, title: str,
         cmd = build_cli_command(provider, "implement", fix_prompt)
         timeout = get_timeout(provider, "implement")
         r = subprocess.run(cmd, cwd=str(PROJECT_DIR),
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           env=_clean_env(), encoding="utf-8", errors="replace")
         if r.returncode == 0:
             log.info("🔒✅ Security issues auto-fixed")
             txt = "\n".join(f"• {f.get('file','?')}: {f.get('issue','?')}" for f in findings)
