@@ -19,6 +19,9 @@ from enum import Enum
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
+from shutil import which
+
+import concurrent.futures
 
 import requests
 
@@ -35,7 +38,8 @@ if ENV_FILE.exists():
             os.environ.setdefault(key.strip(), val.strip())
 
 # ── Config ──────────────────────────────────────────────────────────────────
-PROJECT_DIR   = Path(os.environ.get("PROJECT_DIR", str(AGENT_DIR)))
+_project_dir_setting = Path(os.environ.get("PROJECT_DIR", str(AGENT_DIR)))
+PROJECT_DIR   = _project_dir_setting if _project_dir_setting.is_dir() else AGENT_DIR
 TASKS_FILE    = Path(os.environ.get("TASKS_FILE", str(PROJECT_DIR / "nodered" / "data" / "tasks.json")))
 IDEAS_FILE    = Path(os.environ.get("IDEAS_FILE", str(PROJECT_DIR / "nodered" / "data" / "ideas.json")))
 STATE_FILE    = AGENT_DIR / "agent-state.json"
@@ -71,19 +75,19 @@ PROVIDERS_FILE = AGENT_DIR / "providers.json"
 def _load_providers() -> dict:
     """Load provider definitions from providers.json."""
     if not PROVIDERS_FILE.exists():
-        return {"providers": {}, "default_provider": "copilot"}
+        return {"providers": {}, "default_provider": "claude"}
     try:
         return json.loads(PROVIDERS_FILE.read_text(encoding="utf-8"))
     except Exception as e:
         logging.warning("Could not load providers.json: %s", e)
-        return {"providers": {}, "default_provider": "copilot"}
+        return {"providers": {}, "default_provider": "claude"}
 
 
 def _get_provider(name: str | None = None) -> dict:
     """Get a provider config by name, falling back to default."""
     cfg = _load_providers()
     providers = cfg.get("providers", {})
-    name = (name or "").strip().lower() or cfg.get("default_provider", "copilot")
+    name = (name or "").strip().lower() or cfg.get("default_provider", "claude")
     if name in providers:
         return providers[name]
     # Fuzzy match (e.g. "github-copilot" → "copilot")
@@ -106,6 +110,9 @@ def get_provider_for_phase(phase: str, task_override: str | None = None) -> dict
         "plan":      "CLI_PLAN_PROVIDER",
         "implement": "CLI_IMPLEMENT_PROVIDER",
         "security":  "CLI_SECURITY_PROVIDER",
+        "test":      "CLI_TEST_PROVIDER",
+        "review":    "CLI_REVIEW_PROVIDER",
+        "rewrite":   "CLI_PLAN_PROVIDER",
     }
     env_key = env_map.get(phase, "CLI_PROVIDER")
     provider_name = os.environ.get(env_key) or os.environ.get("CLI_PROVIDER")
@@ -118,13 +125,23 @@ def build_cli_command(provider: dict, phase: str, prompt: str) -> list[str]:
     Replaces {prompt} placeholder in args with the actual prompt text.
     """
     binary = provider["binary"]
+    # Resolve .cmd/.bat/.exe on Windows so subprocess can find it
+    resolved = which(binary)
+    if resolved:
+        binary = resolved
     sub = provider.get("subcommand", [])
 
     arg_key = {
         "plan":      "plan_args",
         "implement": "implement_args",
         "security":  "security_args",
+        "test":      "test_args",
+        "review":    "review_args",
     }.get(phase, "implement_args")
+
+    # Fallback: test/review → plan_args if not defined
+    if arg_key not in provider and phase in ("test", "review"):
+        arg_key = "plan_args"
 
     args = list(provider.get(arg_key, ["-p", "{prompt}"]))
     args = [a.replace("{prompt}", prompt) for a in args]
@@ -135,18 +152,23 @@ def build_cli_command(provider: dict, phase: str, prompt: str) -> list[str]:
 def get_timeout(provider: dict, phase: str) -> int:
     """Get timeout for a phase, checking env overrides then provider config."""
     env_map = {
-        "plan":      "COPILOT_PLAN_TIMEOUT",
-        "implement": "COPILOT_TIMEOUT",
-        "security":  "COPILOT_SECURITY_TIMEOUT",
+        "plan":      ("PIPELINE_PLAN_TIMEOUT",    "COPILOT_PLAN_TIMEOUT"),
+        "implement": ("PIPELINE_CODE_TIMEOUT",    "COPILOT_TIMEOUT"),
+        "security":  ("PIPELINE_REVIEW_TIMEOUT",  "COPILOT_SECURITY_TIMEOUT"),
+        "test":      ("PIPELINE_TEST_TIMEOUT",    "COPILOT_SECURITY_TIMEOUT"),
+        "review":    ("PIPELINE_REVIEW_TIMEOUT",  "COPILOT_SECURITY_TIMEOUT"),
     }
-    env_val = os.environ.get(env_map.get(phase, "COPILOT_TIMEOUT"))
-    if env_val:
-        return int(env_val)
+    for env_key in env_map.get(phase, ("COPILOT_TIMEOUT",)):
+        env_val = os.environ.get(env_key)
+        if env_val:
+            return int(env_val)
 
     timeout_key = {
         "plan":      "plan_timeout",
         "implement": "implement_timeout",
         "security":  "security_timeout",
+        "test":      "test_timeout",
+        "review":    "review_timeout",
     }.get(phase, "implement_timeout")
 
     return int(provider.get(timeout_key, 600))
@@ -177,6 +199,396 @@ _BACKEND_ALIASES = {"cli_copilot": "cli", "copilot": "cli"}
 
 def _normalise_backend(val: str) -> str:
     return _BACKEND_ALIASES.get(val.lower().strip(), val.lower().strip())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PIPELINE — config, helpers, and orchestrator
+# ═══════════════════════════════════════════════════════════════════════════
+
+_PIPELINE_DEFAULT: dict = {
+    "program_manager": {
+        "backend": "github_models",
+        "model": "gpt-4o",
+        "max_tokens": 4096,
+        "temperature": 0.3,
+    },
+    "stages": {
+        "rewrite": {"enabled": True, "timeout": 120},
+        "plan":    {"enabled": True, "team": ["claude"], "timeout": 900},
+        "code":    {"enabled": True, "team": ["claude"], "timeout": 600},
+        "test":    {"enabled": True, "team": ["claude"], "timeout": 300},
+        "review":  {"enabled": True, "team": ["claude"], "timeout": 300},
+    },
+    "publish": {"enabled": True, "auto_push": True, "block_on_severity": "high"},
+}
+
+
+def load_pipeline() -> dict:
+    """Load pipeline.json; returns built-in default if absent or unreadable."""
+    pipeline_file = Path(os.environ.get("PIPELINE_FILE", str(AGENT_DIR / "pipeline.json")))
+    if not pipeline_file.exists():
+        return _PIPELINE_DEFAULT
+    try:
+        return json.loads(pipeline_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        logging.warning("Could not load pipeline.json: %s — using defaults", e)
+        return _PIPELINE_DEFAULT
+
+
+def run_cli_command(provider: dict, phase: str, prompt: str,
+                    cwd: str | None = None) -> tuple[bool, str]:
+    """Run a CLI provider command. Returns (success, output_text)."""
+    cmd = build_cli_command(provider, phase, prompt)
+    timeout = get_timeout(provider, phase)
+    work_dir = cwd or str(PROJECT_DIR)
+    # Fall back to agent dir if target dir doesn't exist
+    if not Path(work_dir).is_dir():
+        log.warning("   cwd '%s' does not exist — falling back to %s", work_dir, AGENT_DIR)
+        work_dir = str(AGENT_DIR)
+    log.info("   CLI [%s/%s]: %s ... (timeout=%ds)",
+             provider.get("name", "?"), phase, " ".join(cmd[:3]), timeout)
+    try:
+        result = subprocess.run(
+            cmd, cwd=work_dir,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        log.info("   Exit code: %d", result.returncode)
+        if result.stdout:
+            log.debug("   Stdout tail: %s", result.stdout[-1000:])
+        if result.stderr:
+            log.warning("   Stderr tail: %s", result.stderr[-500:])
+        output = result.stdout.strip() if result.stdout else result.stderr.strip()
+        return result.returncode == 0, output
+    except subprocess.TimeoutExpired:
+        log.error("   Timed out after %ds", timeout)
+        return False, f"Timed out after {timeout}s"
+    except Exception as e:
+        log.error("   CLI error: %s", e)
+        return False, str(e)
+
+
+def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict) -> str:
+    """Low-level PM API call. Raises on failure."""
+    backend = pm_cfg.get("backend", "github_models")
+    model = pm_cfg.get("model", "gpt-4o")
+    max_tokens = pm_cfg.get("max_tokens", 4096)
+    temperature = pm_cfg.get("temperature", 0.3)
+    pm_timeout = int(os.environ.get("PIPELINE_MANAGER_TIMEOUT", "300"))
+
+    if backend == "github_models":
+        if not GITHUB_TOKEN:
+            raise ValueError("GITHUB_TOKEN not set")
+        resp = requests.post(
+            GITHUB_MODELS_URL,
+            headers={"Authorization": f"Bearer {GITHUB_TOKEN}",
+                     "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            timeout=pm_timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    elif backend == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY not set")
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": system_msg,
+                "messages": [{"role": "user", "content": user_msg}],
+            },
+            timeout=pm_timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()["content"][0]["text"]
+
+    elif backend == "openai_compatible":
+        url = os.environ.get("PIPELINE_PM_URL",
+                             "http://localhost:11434/v1/chat/completions")
+        key = os.environ.get("PIPELINE_PM_KEY") or os.environ.get("OPENAI_API_KEY", "")
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            timeout=pm_timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    else:
+        raise ValueError(f"Unknown PM backend: {backend}")
+
+
+def pm_direct_team(stage_name: str, original_prompt: str, context: str,
+                   team: list, pm_cfg: dict) -> str:
+    """
+    PM acts as director BEFORE the team runs: given the stage, request, and all
+    prior context, it writes a precise task brief for the team to execute.
+    Falls back to the original prompt on failure.
+    """
+    system_msg = "You are a Program Manager directing an AI coding team."
+    user_msg = (
+        f"Stage: {stage_name}\n"
+        f"Team members: {', '.join(team)}\n"
+        f"Original user request: {original_prompt}\n\n"
+        f"Prior pipeline context:\n{context}\n\n"
+        "Write a clear, specific task brief for the team to execute in this stage. "
+        "Include: what to do, what files/components to focus on, any constraints from prior stages, "
+        "and the expected output format. Be concise and actionable. "
+        "Return only the task brief — no preamble."
+    )
+    log.info("   PM [direct/%s]: generating task brief for team %s…", stage_name, team)
+    try:
+        return _pm_api_call(system_msg, user_msg, pm_cfg)
+    except Exception as e:
+        log.warning("⚠️ PM direction failed (%s) — using original prompt", e)
+        return original_prompt
+
+
+def call_program_manager(stage_name: str, original_prompt: str, context: str,
+                          team_outputs: list, pm_cfg: dict) -> str:
+    """
+    PM acts as synthesizer AFTER the team runs: receives all team outputs,
+    picks the best unified result, and writes a handoff brief for the next stage.
+    Falls back to concatenating team outputs on any API failure (non-fatal).
+    """
+    agent_blocks = "\n\n".join(
+        f"--- Agent: {name} ---\n{output}" for name, output in team_outputs
+    )
+    system_msg = "You are a Program Manager overseeing an AI coding pipeline."
+    user_msg = (
+        f"Stage: {stage_name}\n"
+        f"Original user request: {original_prompt}\n\n"
+        f"{context}\n\n"
+        f"The following agents worked on this stage simultaneously:\n\n"
+        f"{agent_blocks}\n\n"
+        "Synthesize the best unified result. Then write a clear handoff brief for the next stage.\n"
+        "Return your response in two sections:\n"
+        "## Synthesis\n[the best combined output]\n\n"
+        "## Handoff to next stage\n[precise instructions/context for the next team]"
+    )
+
+    log.info("   PM [synthesize/%s]: combining %d agent output(s)…",
+             stage_name, len(team_outputs))
+    try:
+        return _pm_api_call(system_msg, user_msg, pm_cfg)
+    except Exception as e:
+        log.warning("⚠️ Program Manager synthesis failed (%s) — concatenating outputs", e)
+        return "\n\n".join(f"## {name}\n{output}" for name, output in team_outputs)
+
+
+def run_team(stage_name: str, prompt: str, team_provider_names: list,
+             context: str, timeout: int) -> list:
+    """
+    Run a team of CLI providers in parallel for a pipeline stage.
+    Returns list of (provider_name, output) for successful runs only.
+    """
+    phase_map = {
+        "rewrite": "plan",
+        "plan":    "plan",
+        "code":    "implement",
+        "test":    "test",
+        "review":  "review",
+    }
+    phase = phase_map.get(stage_name, "implement")
+    combined_prompt = f"{context}\n\n{prompt}".strip() if context else prompt
+
+    def _run_one(provider_name: str):
+        try:
+            provider = get_provider_for_phase(phase, provider_name)
+            success, output = run_cli_command(provider, phase, combined_prompt)
+            if success and output:
+                return provider_name, output
+            log.warning("   Team member '%s' failed or empty", provider_name)
+            return None
+        except Exception as e:
+            log.warning("   Team member '%s' error: %s", provider_name, e)
+            return None
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, len(team_provider_names))
+    ) as ex:
+        futures = {ex.submit(_run_one, name): name for name in team_provider_names}
+        for fut in concurrent.futures.as_completed(futures, timeout=timeout + 30):
+            try:
+                res = fut.result()
+                if res:
+                    results.append(res)
+            except Exception as e:
+                log.warning("   Team future error: %s", e)
+    return results
+
+
+def rewrite_prompt(raw_prompt: str, pm_cfg: dict) -> str:
+    """Have the PM rewrite the raw prompt for clarity. Falls back to original on failure."""
+    system_msg = "You are a Program Manager preparing a user request for an AI coding pipeline."
+    user_msg = (
+        "Rewrite the following user request to be maximally clear, specific, and actionable "
+        "for a coding AI pipeline. Preserve all intent. "
+        "Return only the rewritten prompt — no explanation, no preamble.\n\n"
+        f"Original request:\n{raw_prompt}"
+    )
+    log.info("   PM [rewrite]: clarifying prompt…")
+    try:
+        result = _pm_api_call(system_msg, user_msg, pm_cfg)
+        return result.strip() or raw_prompt
+    except Exception as e:
+        log.warning("⚠️ PM rewrite failed (%s) — using original prompt", e)
+        return raw_prompt
+
+
+def _cap_context(context: str, max_chars: int = 12000) -> str:
+    """Cap context to max_chars by dropping oldest ## sections first."""
+    if len(context) <= max_chars:
+        return context
+    sections = re.split(r'(?=## [A-Z])', context)
+    while len("".join(sections)) > max_chars and len(sections) > 1:
+        sections.pop(0)
+    return "".join(sections)
+
+
+def run_pipeline(prompt: str, task_id: str | None = None,
+                 pipeline_cfg: dict | None = None,
+                 start_stage: str | None = None) -> dict:
+    """
+    Full pipeline: rewrite → plan → code → test → review → publish.
+
+    The Program Manager acts as director between each stage: it receives all team
+    outputs, synthesizes the best result, and writes a handoff brief that becomes
+    the context injected into the next stage's team prompts.
+
+    start_stage: skip all stages before this one ('plan', 'code', 'test', 'review').
+    Returns {"success": bool, "stage_results": {...}, "published": bool, "error": str|None}
+    """
+    cfg = pipeline_cfg or load_pipeline()
+    stages_cfg = cfg.get("stages", {})
+    pm_cfg = cfg.get("program_manager", {})
+    publish_cfg = cfg.get("publish", {})
+
+    context = ""
+    stage_results: dict = {}
+    original_prompt = prompt
+    tid = task_id or f"pipeline-{int(time.time())}"
+
+    STAGE_ORDER = ["rewrite", "plan", "code", "test", "review"]
+    skip = bool(start_stage)
+
+    log.info("🚀 Pipeline starting for: %s (start_stage=%s)", tid, start_stage or "rewrite")
+
+    for stage in STAGE_ORDER:
+        if skip:
+            if stage == start_stage:
+                skip = False
+            else:
+                log.info("   ⏭️ Skipping stage '%s'", stage)
+                continue
+
+        stage_cfg = stages_cfg.get(stage, {})
+        if not stage_cfg.get("enabled", True):
+            log.info("   ⏭️ Stage '%s' disabled", stage)
+            continue
+
+        timeout = int(os.environ.get(
+            f"PIPELINE_{stage.upper()}_TIMEOUT",
+            str(stage_cfg.get("timeout", 300))
+        ))
+        team = stage_cfg.get("team", ["claude"])
+
+        log.info("   ▶️ Stage: %-8s | team: %s | timeout: %ds", stage, team, timeout)
+        with status_lock:
+            agent_status["state"] = f"pipeline:{stage}"
+
+        # ── Rewrite: PM-only, no CLI team ───────────────────────────────────
+        if stage == "rewrite":
+            prompt = rewrite_prompt(original_prompt, pm_cfg)
+            stage_results["rewrite"] = prompt
+            log.info("   Rewritten prompt (%d chars)", len(prompt))
+            continue
+
+        # ── Review: use structured security review, PM synthesizes verdict ──
+        if stage == "review":
+            review = run_security_review(tid, (prompt[:80] or tid))
+            team_outputs = [("security-review", review.get("report", "No report."))]
+            pm_result = call_program_manager(
+                stage, original_prompt, context, team_outputs, pm_cfg
+            )
+            stage_results["review"] = pm_result
+            context += f"\n\n## REVIEW HANDOFF\n{pm_result}"
+            context = _cap_context(context)
+
+            action = _handle_security_findings(
+                review, tid, prompt[:80] or tid, [], False
+            )
+            if action == "blocked":
+                log.warning("🔒 Pipeline blocked by security review for: %s", tid)
+                return {
+                    "success": False,
+                    "stage_results": stage_results,
+                    "published": False,
+                    "error": "Blocked by security review (HIGH severity)",
+                }
+            continue
+
+        # ── Plan / Code / Test: PM directs → team runs in parallel → PM synthesizes ──
+        # PM writes a directed task brief for the team based on all prior context
+        directed_prompt = pm_direct_team(stage, prompt, context, team, pm_cfg)
+        team_outputs = run_team(stage, directed_prompt, team, context, timeout)
+
+        if not team_outputs:
+            log.warning("⚠️ Stage '%s' — no team output, continuing", stage)
+            stage_results[stage] = ""
+            continue
+
+        # After code stage, restart any changed services
+        if stage == "code":
+            _restart_changed_services()
+
+        pm_result = call_program_manager(
+            stage, original_prompt, context, team_outputs, pm_cfg
+        )
+        stage_results[stage] = pm_result
+        context += f"\n\n## {stage.upper()} HANDOFF\n{pm_result}"
+        context = _cap_context(context)
+
+    # ── Publish ──────────────────────────────────────────────────────────────
+    published = False
+    if publish_cfg.get("enabled", True) and publish_cfg.get("auto_push", True):
+        title = prompt[:80] if not task_id else task_id
+        log.info("📤 Publishing: %s", title)
+        published = _git_commit_and_push(tid, title, label="pipeline")
+
+    with status_lock:
+        agent_status["state"] = "idle"
+
+    log.info("✅ Pipeline complete for: %s (published=%s)", tid, published)
+    return {"success": True, "stage_results": stage_results,
+            "published": published, "error": None}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -241,6 +653,18 @@ class TriggerHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.rstrip("/") == "/trigger":
+            body = self._read_body()
+            if body is None:
+                return
+            prompt = body.get("prompt") if body else None
+            if prompt:
+                log.info("🚨 Trigger with prompt — launching pipeline: %s", prompt[:100])
+                threading.Thread(
+                    target=run_pipeline, args=(prompt,), daemon=True
+                ).start()
+                self._json(200, {"ok": True, "message": "Pipeline started!",
+                                 "prompt": prompt[:100]})
+                return
             trigger_event.set()
             with status_lock:
                 agent_status["last_trigger"] = datetime.now().isoformat()
@@ -304,9 +728,21 @@ class TriggerHandler(BaseHTTPRequestHandler):
                 snap = dict(agent_status)
             snap["providers"] = list_available_providers()
             snap["default_provider"] = os.environ.get("CLI_PROVIDER",
-                                        _load_providers().get("default_provider", "copilot"))
+                                        _load_providers().get("default_provider", "claude"))
             snap["default_planning_backend"] = DEFAULT_PLANNING_BACKEND
             snap["session_dir"] = str(SESSION_DIR)
+            pipeline_cfg = load_pipeline()
+            snap["pipeline_stages"] = {
+                name: {
+                    "enabled": cfg.get("enabled", True),
+                    "team":    cfg.get("team", ["claude"]),
+                    "timeout": cfg.get("timeout", 300),
+                }
+                for name, cfg in pipeline_cfg.get("stages", {}).items()
+            }
+            snap["pipeline_pm_backend"] = (
+                pipeline_cfg.get("program_manager", {}).get("backend", "github_models")
+            )
             self._json(200, snap)
         elif self.path.startswith("/research-status/"):
             idea_id = self.path.split("/research-status/", 1)[1].rstrip("/")
@@ -567,105 +1003,14 @@ def run_research(idea_id: str, title: str, description: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PLANNING (multi-backend)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def generate_plan(backend: str, prompt: str, task_id: str, state: dict,
-                  task_type: str = "task", provider_override: str | None = None) -> tuple[bool, str]:
-    backend = _normalise_backend(backend)
-    log.info("📐 Generating plan using backend: %s", backend)
-
-    if backend == "cli":
-        return launch_cli_plan(prompt, task_id, state, provider_override)
-
-    elif backend == "gpt4o_api":
-        system_prompt = (
-            f"You are an AI assistant for a coding project.\n"
-            f"Analyze this {task_type} and provide:\n"
-            f"1. **SUMMARY**\n2. **IMPLEMENTATION PLAN**\n3. **FILES TO CHANGE**\n"
-            f"4. **COPILOT PROMPT** — a single prompt for a coding CLI to implement this\n"
-            f"5. **NEXT STEPS**\n\n"
-            f"The project is at {PROJECT_DIR}. Be specific and actionable."
-        )
-        plan = call_gpt4o(system_prompt, prompt, state)
-        return (True, plan) if plan else (False, "GPT-4o API call failed or rate limited")
-
-    elif backend == "custom_api":
-        log.warning("⚠️ Custom API backend not yet implemented")
-        return False, "Custom API backend not yet implemented"
-
-    else:
-        log.error("❌ Unknown planning backend: %s", backend)
-        return False, f"Unknown planning backend: {backend}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  CLI LAUNCH — PLAN
-# ═══════════════════════════════════════════════════════════════════════════
-
-def launch_cli_plan(prompt: str, task_id: str, state: dict,
-                    provider_override: str | None = None) -> tuple[bool, str]:
-    provider = get_provider_for_phase("plan", provider_override)
-    timeout = get_timeout(provider, "plan")
-
-    log.info("📐 Running %s (plan mode) for %s…", provider.get("name", "CLI"), task_id)
-    log.info("   Prompt: %s", prompt[:200])
-
-    session_path = SESSION_DIR / task_id
-    session_path.mkdir(parents=True, exist_ok=True)
-    plan_file = session_path / "plan.md"
-    if plan_file.exists():
-        plan_file.unlink()
-
-    try:
-        safe_prompt = prompt.replace('"', "'")
-        plan_prompt = f"[[PLAN]] {safe_prompt}"
-        cmd = build_cli_command(provider, "plan", plan_prompt)
-
-        log.info("   Command: %s (cwd=%s, timeout=%ds)",
-                 " ".join(cmd[:3]) + " ...", PROJECT_DIR, timeout)
-        result = subprocess.run(
-            cmd, cwd=str(PROJECT_DIR),
-            capture_output=True, text=True, timeout=timeout,
-        )
-
-        log.info("   Exit code: %d", result.returncode)
-        if result.stdout:
-            log.info("   Output (tail):\n%s", result.stdout[-2000:])
-        if result.stderr:
-            log.warning("   Stderr (tail):\n%s", result.stderr[-1000:])
-
-        if result.returncode != 0:
-            err = result.stderr[-500:] if result.stderr else result.stdout[-500:]
-            return False, f"Planning failed (exit {result.returncode}): {err}"
-
-        if plan_file.exists():
-            plan_text = plan_file.read_text(encoding="utf-8")
-            log.info("✅ Plan generated (%d chars) at %s", len(plan_text), session_path)
-            return True, plan_text
-
-        # Some providers may output the plan to stdout instead of plan.md
-        if result.stdout and len(result.stdout.strip()) > 50:
-            log.info("✅ Plan captured from stdout (%d chars)", len(result.stdout))
-            return True, result.stdout.strip()
-
-        return False, "Planning completed but no plan output found"
-
-    except subprocess.TimeoutExpired:
-        return False, f"Planning timed out after {timeout}s"
-    except Exception as e:
-        return False, f"Planning error: {e}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 #  CLI LAUNCH — IMPLEMENT
 # ═══════════════════════════════════════════════════════════════════════════
 
 def launch_cli_implement(prompt: str, task_id: str, tasks: list,
                          is_idea: bool = False, plan_path: str | None = None,
                          provider_override: str | None = None) -> bool:
+    """Run a single CLI implement step. Security review and push are handled by run_pipeline."""
     provider = get_provider_for_phase("implement", provider_override)
-    timeout = get_timeout(provider, "implement")
     label = "idea" if is_idea else "task"
 
     log.info("🚀 Running %s (implement) for %s %s…",
@@ -673,100 +1018,28 @@ def launch_cli_implement(prompt: str, task_id: str, tasks: list,
     log.info("   Prompt: %s", prompt[:200])
 
     if plan_path and Path(plan_path).exists():
-        log.info("   Plan at: %s", plan_path)
         safe_prompt = f"Implement the plan at {plan_path}. {prompt}".replace('"', "'")
     else:
         safe_prompt = prompt.replace('"', "'")
 
-    try:
-        cmd = build_cli_command(provider, "implement", safe_prompt)
-        log.info("   Command: %s (cwd=%s, timeout=%ds)",
-                 " ".join(cmd[:3]) + " ...", PROJECT_DIR, timeout)
+    success, output = run_cli_command(provider, "implement", safe_prompt)
 
-        result = subprocess.run(
-            cmd, cwd=str(PROJECT_DIR),
-            capture_output=True, text=True, timeout=timeout,
-        )
-        log.info("   Exit code: %d", result.returncode)
-        if result.stdout:
-            log.info("   Output (tail):\n%s", result.stdout[-2000:])
-        if result.stderr:
-            log.warning("   Stderr (tail):\n%s", result.stderr[-1000:])
-
-        if result.returncode != 0:
-            log.warning("⚠️ CLI exited with code %d", result.returncode)
-            if is_idea:
-                _update_idea_status(task_id, tasks, "open",
-                    f"CLI failed (exit {result.returncode}). Needs manual attention.")
-            else:
-                _update_task_status(task_id, tasks, "open",
-                    f"CLI failed (exit {result.returncode}). Needs manual attention.")
-            notify_ha(f"⚠️ {label.title()} needs you: {task_id}",
-                      f"CLI couldn't complete.\n\n{result.stderr[-300:] or result.stdout[-300:]}")
-            return False
-
-        # Success path
-        _restart_changed_services()
-
+    if not success:
+        log.warning("⚠️ CLI exited with error for %s %s", label, task_id)
+        err_snippet = output[-300:] if output else "no output"
         if is_idea:
-            _update_idea_status(task_id, tasks, "done", "Implemented automatically by agent.")
+            _update_idea_status(task_id, tasks, "open",
+                f"CLI failed. Needs manual attention.\n{err_snippet}")
         else:
-            _update_task_status(task_id, tasks, "done", "Implemented automatically by agent.")
-        notify_ha(f"✅ {label.title()} completed: {task_id}",
-                  f"CLI implemented this and restarted affected services.")
-        log.info("✅ CLI completed successfully")
-
-        # ── Security review before push ─────────────────────────────────
-        title = task_id
-        for t in tasks:
-            if t.get("id") == task_id:
-                title = t.get("title", task_id)
-                break
-
-        review = run_security_review(task_id, title)
-        action = _handle_security_findings(review, task_id, title, tasks, is_idea)
-
-        if action == "blocked":
-            log.warning("🔒🚫 Push blocked by security review for: %s", title)
-            return False
-        if action == "fixed":
-            log.info("🔒🔧 Security fixes applied — proceeding to push")
-
-        # Commit and push
-        pushed = _git_commit_and_push(task_id, title, label="implemented")
-        if pushed:
-            if is_idea:
-                _update_idea_status(task_id, tasks, "pushed-to-production",
-                    "Changes committed and pushed to production.")
-            else:
-                _update_task_status(task_id, tasks, "pushed-to-production",
-                    "Changes committed and pushed to production.")
-            notify_ha(f"🚀 Pushed to production: {title}",
-                      f"{label.title()} {task_id} implemented and pushed to main.")
-            log.info("🚀 Changes pushed to production")
-        else:
-            notify_ha(f"⚠️ Push failed: {title}",
-                      f"{label.title()} completed but could not be pushed. Push manually.")
-            log.warning("⚠️ Git push failed")
-
-        return True
-
-    except subprocess.TimeoutExpired:
-        log.error("⏰ CLI timed out after %ds", timeout)
-        if is_idea:
-            _update_idea_status(task_id, tasks, "open", f"Timed out after {timeout}s.")
-        else:
-            _update_task_status(task_id, tasks, "open", f"Timed out after {timeout}s.")
-        notify_ha(f"⏰ {label.title()} timed out: {task_id}", "Please check manually.")
+            _update_task_status(task_id, tasks, "open",
+                f"CLI failed. Needs manual attention.\n{err_snippet}")
+        notify_ha(f"⚠️ {label.title()} needs you: {task_id}",
+                  f"CLI couldn't complete.\n\n{err_snippet}")
         return False
-    except Exception as e:
-        log.error("CLI launch failed: %s", e)
-        if is_idea:
-            _update_idea_status(task_id, tasks, "open", f"Launch failed: {e}")
-        else:
-            _update_task_status(task_id, tasks, "open", f"Launch failed: {e}")
-        notify_ha(f"❌ {label.title()} failed: {task_id}", str(e)[:300])
-        return False
+
+    _restart_changed_services()
+    log.info("✅ CLI completed successfully for %s", task_id)
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1036,7 +1309,6 @@ def _implement_planned_task(task_id: str, target: dict, collection: list,
                             is_idea: bool, state: dict):
     title = target.get("title", task_id)
     plan = target.get("plan", "")
-    planning_backend = _normalise_backend(target.get("plan_backend_used", DEFAULT_PLANNING_BACKEND))
 
     log.info("🚀 Starting manual implementation for: %s", title)
     if is_idea:
@@ -1051,17 +1323,9 @@ def _implement_planned_task(task_id: str, target: dict, collection: list,
             break
     (save_ideas if is_idea else save_tasks)(collection)
 
-    desc = target.get("description", "")
-    copilot_prompt = (_extract_idea_copilot_prompt if is_idea else extract_copilot_prompt)(plan, title, desc)
-
-    plan_path = None
-    if planning_backend == "cli":
-        plan_path = str(SESSION_DIR / task_id / "plan.md")
-
-    provider_override = target.get("cli_provider")
-    success = launch_cli_implement(copilot_prompt, task_id, collection,
-                                   is_idea=is_idea, plan_path=plan_path,
-                                   provider_override=provider_override)
+    # Start from code stage — the plan is already done, use it as context
+    prompt = f"Implement the following plan for: {title}\n\n{plan}"
+    result = run_pipeline(prompt, task_id=task_id, start_stage="code")
 
     for item in collection:
         if item.get("id") == task_id:
@@ -1069,27 +1333,25 @@ def _implement_planned_task(task_id: str, target: dict, collection: list,
             break
     (save_ideas if is_idea else save_tasks)(collection)
 
-    if success:
+    if result["success"]:
+        status = "pushed-to-production" if result["published"] else "done"
+        if is_idea:
+            _update_idea_status(task_id, collection, status, "Manual implementation completed.")
+        else:
+            _update_task_status(task_id, collection, status, "Manual implementation completed.")
         notify_ha(f"✅ Completed: {title}", f"Manual implementation successful!\n\n**Plan:**\n{plan[:300]}")
     else:
-        notify_ha(f"⚠️ Failed: {title}", f"Manual implementation error.\n\n**Plan:**\n{plan[:300]}")
+        err = result.get("error", "Pipeline failed")
+        if is_idea:
+            _update_idea_status(task_id, collection, "open", f"Implementation failed: {err}")
+        else:
+            _update_task_status(task_id, collection, "open", f"Implementation failed: {err}")
+        notify_ha(f"⚠️ Failed: {title}", f"Manual implementation error.\n\n{err}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  PROCESS TASK / IDEA
 # ═══════════════════════════════════════════════════════════════════════════
-
-def extract_copilot_prompt(analysis: str, title: str, desc: str) -> str:
-    for line in analysis.split("\n"):
-        if "copilot prompt" in line.lower() and ":" in line:
-            prompt = line.split(":", 1)[1].strip().strip('"').strip("'").strip("`")
-            if len(prompt) > 10:
-                return prompt
-    return f"Implement this feature: {title}. {desc[:200]}"
-
-
-def _extract_idea_copilot_prompt(analysis: str, title: str, desc: str) -> str:
-    return extract_copilot_prompt(analysis, title, desc)
 
 
 def _extract_next_steps(analysis: str) -> str:
@@ -1126,81 +1388,45 @@ def process_task(task: dict, tasks: list, state: dict):
     priority = task.get("priority", "medium")
     task_id = task.get("id", "")
 
-    planning_backend = _normalise_backend(task.get("planning_backend", DEFAULT_PLANNING_BACKEND))
-    auto_implement = task.get("auto_implement", AUTO_IMPLEMENT_DEFAULT)
-    provider_override = task.get("cli_provider")
-
     log.info("=" * 60)
     log.info("📋 New %s: %s", task_type, title)
     log.info("   Priority: %s | ID: %s", priority, task_id)
     log.info("   Description: %s", desc[:200])
-    log.info("   Backend: %s | Auto-implement: %s | CLI provider: %s",
-             planning_backend, auto_implement, provider_override or "default")
 
     _update_task_status(task_id, tasks, "grabbed", "Agent has picked up this task.")
     notify_ha(f"🤖 Agent grabbed task: {title}",
               f"Processing {task_type} (priority: {priority}).\nTask ID: {task_id}")
 
-    # Build planning prompt
-    planning_prompt = f"Task Type: {task_type}\nTitle: {title}\nPriority: {priority}\nDescription: {desc}"
+    prompt = f"Task Type: {task_type}\nTitle: {title}\nPriority: {priority}\nDescription: {desc}"
     photos = task.get("photos", [])
     if photos:
-        planning_prompt += f"\n\nAttached Photos ({len(photos)}): {', '.join(photos)}"
-        planning_prompt += f"\nPhotos in {PROJECT_DIR / 'task-photos'}"
+        prompt += f"\n\nAttached Photos ({len(photos)}): {', '.join(photos)}"
+        prompt += f"\nPhotos in {PROJECT_DIR / 'task-photos'}"
 
-    plan_success, plan_text = generate_plan(planning_backend, planning_prompt, task_id, state,
-                                            "task", provider_override)
+    _update_task_status(task_id, tasks, "in-progress", "Pipeline started.")
+    result = run_pipeline(prompt, task_id=task_id)
 
-    if plan_success:
-        log.info("\n📐 Plan generated:\n%s", plan_text[:500])
-        session_path = SESSION_DIR / task_id
-        for t in tasks:
-            if t.get("id") == task_id:
+    plan_text = result.get("stage_results", {}).get("plan", "")
+    for t in tasks:
+        if t.get("id") == task_id:
+            if plan_text:
                 t["plan"] = plan_text
-                t["plan_backend_used"] = planning_backend
                 t["planning_completed_at"] = datetime.now().isoformat()
-                t["copilot_session_path"] = str(session_path)
-                t["status"] = "planned" if not auto_implement else "in-progress"
-                t["updated"] = _ts_ms()
-                if "ai_analysis" not in t:
-                    t["ai_analysis"] = plan_text
-                break
-        save_tasks(tasks)
+            t["implementation_completed_at"] = datetime.now().isoformat()
+            t["updated"] = _ts_ms()
+            break
+    save_tasks(tasks)
 
-        _git_commit_and_push(task_id, title, label="planned", backend=planning_backend)
-
-        if auto_implement:
-            log.info("🚀 Auto-implement enabled — starting…")
-            for t in tasks:
-                if t.get("id") == task_id:
-                    t["implementation_started_at"] = datetime.now().isoformat()
-                    break
-            save_tasks(tasks)
-
-            copilot_prompt = extract_copilot_prompt(plan_text, title, desc)
-            copilot_prompt += _build_photo_context(task)
-            plan_path = str(session_path / "plan.md") if planning_backend == "cli" else None
-
-            success = launch_cli_implement(copilot_prompt, task_id, tasks,
-                                           plan_path=plan_path, provider_override=provider_override)
-
-            for t in tasks:
-                if t.get("id") == task_id:
-                    t["implementation_completed_at"] = datetime.now().isoformat()
-                    break
-            save_tasks(tasks)
-
-            if success:
-                notify_ha(f"✅ Auto-completed: {title}", f"Plan:\n{plan_text[:400]}")
-            else:
-                notify_ha(f"⚠️ Needs help: {title}", f"Plan:\n{plan_text[:400]}")
-        else:
-            notify_ha(f"📐 Plan ready: {title}",
-                      f"Auto-implement disabled. Use 'Implement Now'.\n\n{plan_text[:300]}")
+    if result["success"]:
+        status = "pushed-to-production" if result["published"] else "done"
+        _update_task_status(task_id, tasks, status, "Pipeline completed.")
+        notify_ha(f"✅ Task completed: {title}",
+                  f"Pipeline finished. Published: {result['published']}")
     else:
-        log.warning("⚠️ Could not generate plan: %s", plan_text)
-        _update_task_status(task_id, tasks, "open", f"Planning failed: {plan_text}")
-        notify_ha(f"❌ Planning failed: {title}", f"Error: {plan_text}\n\nDescription: {desc[:200]}")
+        err = result.get("error", "Pipeline failed")
+        new_status = "security-blocked" if "security" in err.lower() else "open"
+        _update_task_status(task_id, tasks, new_status, f"Pipeline failed: {err}")
+        notify_ha(f"❌ Task failed: {title}", err)
 
 
 def process_idea(idea: dict, ideas: list, state: dict):
@@ -1208,73 +1434,38 @@ def process_idea(idea: dict, ideas: list, state: dict):
     desc = idea.get("description", "(no description)")
     idea_id = idea.get("id", "")
 
-    planning_backend = _normalise_backend(idea.get("planning_backend", DEFAULT_PLANNING_BACKEND))
-    auto_implement = idea.get("auto_implement", AUTO_IMPLEMENT_DEFAULT)
-    provider_override = idea.get("cli_provider")
-
     log.info("=" * 60)
     log.info("💡 New idea: %s", title)
-    log.info("   ID: %s | Backend: %s | CLI provider: %s",
-             idea_id, planning_backend, provider_override or "default")
+    log.info("   ID: %s", idea_id)
 
     _update_idea_status(idea_id, ideas, "planning", "Agent is analyzing this idea.")
     notify_ha(f"💡 Agent planning idea: {title}", f"Idea ID: {idea_id}")
 
-    planning_prompt = f"Idea: {title}\nDescription: {desc}"
-    plan_success, plan_text = generate_plan(planning_backend, planning_prompt, idea_id, state,
-                                            "idea", provider_override)
+    prompt = f"Idea: {title}\nDescription: {desc}"
+    _update_idea_status(idea_id, ideas, "in-progress", "Pipeline started.")
+    result = run_pipeline(prompt, task_id=idea_id)
 
-    if plan_success:
-        log.info("\n📐 Idea plan:\n%s", plan_text[:500])
-        next_steps = _extract_next_steps(plan_text)
-        session_path = SESSION_DIR / idea_id
-
-        for i in ideas:
-            if i.get("id") == idea_id:
+    plan_text = result.get("stage_results", {}).get("plan", "")
+    for i in ideas:
+        if i.get("id") == idea_id:
+            if plan_text:
                 i["plan"] = plan_text
-                i["plan_backend_used"] = planning_backend
-                i["next_steps"] = next_steps
                 i["planning_completed_at"] = datetime.now().isoformat()
-                i["copilot_session_path"] = str(session_path)
-                i["status"] = "planned" if not auto_implement else "in-progress"
-                i["updated"] = _ts_ms()
-                break
-        save_ideas(ideas)
+            i["implementation_completed_at"] = datetime.now().isoformat()
+            i["updated"] = _ts_ms()
+            break
+    save_ideas(ideas)
 
-        _git_commit_and_push(idea_id, title, label="planned", backend=planning_backend)
-
-        if auto_implement:
-            log.info("🚀 Auto-implement enabled — starting…")
-            for i in ideas:
-                if i.get("id") == idea_id:
-                    i["implementation_started_at"] = datetime.now().isoformat()
-                    break
-            save_ideas(ideas)
-
-            copilot_prompt = _extract_idea_copilot_prompt(plan_text, title, desc)
-            plan_path = str(session_path / "plan.md") if planning_backend == "cli" else None
-
-            success = launch_cli_implement(copilot_prompt, idea_id, ideas,
-                                           is_idea=True, plan_path=plan_path,
-                                           provider_override=provider_override)
-
-            for i in ideas:
-                if i.get("id") == idea_id:
-                    i["implementation_completed_at"] = datetime.now().isoformat()
-                    break
-            save_ideas(ideas)
-
-            if success:
-                notify_ha(f"✅ Idea implemented: {title}", f"Next steps:\n{next_steps[:400]}")
-            else:
-                notify_ha(f"⚠️ Idea needs help: {title}", f"Plan:\n{plan_text[:400]}")
-        else:
-            notify_ha(f"📐 Plan ready: {title}",
-                      f"Auto-implement disabled.\n\nNext steps:\n{next_steps[:300]}")
+    if result["success"]:
+        status = "pushed-to-production" if result["published"] else "done"
+        _update_idea_status(idea_id, ideas, status, "Pipeline completed.")
+        notify_ha(f"✅ Idea completed: {title}",
+                  f"Pipeline finished. Published: {result['published']}")
     else:
-        log.warning("⚠️ Could not plan idea: %s", plan_text)
-        _update_idea_status(idea_id, ideas, "open", f"Planning failed: {plan_text}")
-        notify_ha(f"❌ Planning failed: {title}", f"Error: {plan_text}")
+        err = result.get("error", "Pipeline failed")
+        new_status = "security-blocked" if "security" in err.lower() else "open"
+        _update_idea_status(idea_id, ideas, new_status, f"Pipeline failed: {err}")
+        notify_ha(f"❌ Idea failed: {title}", err)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1282,6 +1473,15 @@ def process_idea(idea: dict, ideas: list, state: dict):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
+    # ── Direct CLI invocation: python task-claw.py "my prompt" ──────────────
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
+        prompt_arg = " ".join(sys.argv[1:])
+        log.info("🦀 Task-Claw direct pipeline mode: %s", prompt_arg[:100])
+        result = run_pipeline(prompt_arg)
+        log.info("Pipeline result: success=%s, published=%s, error=%s",
+                 result["success"], result["published"], result.get("error"))
+        sys.exit(0 if result["success"] else 1)
+
     log.info("🦀 Task-Claw Agent starting…")
     log.info("   Project dir:  %s", PROJECT_DIR)
     log.info("   Tasks file:   %s", TASKS_FILE)
@@ -1313,7 +1513,6 @@ def main():
     while True:
         try:
             state = load_state()
-            remaining = MAX_API_CALLS_PER_DAY - state.get("api_calls_today", 0)
 
             tasks = load_tasks()
             new_tasks = [
@@ -1336,28 +1535,14 @@ def main():
                 agent_status["last_run"] = datetime.now().isoformat()
 
             if new_tasks or new_ideas:
-                log.info("🔍 Found %d new task(s) and %d new idea(s)! (API budget: %d/%d)",
-                         len(new_tasks), len(new_ideas), remaining, MAX_API_CALLS_PER_DAY)
+                log.info("🔍 Found %d new task(s) and %d new idea(s)!",
+                         len(new_tasks), len(new_ideas))
 
                 log.info("⬇️ Pulling latest changes…")
                 _git_pull()
 
-                # Split by backend type
-                cli_tasks = [t for t in new_tasks
-                             if _normalise_backend(t.get("planning_backend", DEFAULT_PLANNING_BACKEND)) == "cli"]
-                api_tasks = [t for t in new_tasks
-                             if _normalise_backend(t.get("planning_backend", DEFAULT_PLANNING_BACKEND)) != "cli"]
-                cli_ideas = [i for i in new_ideas
-                             if _normalise_backend(i.get("planning_backend", DEFAULT_PLANNING_BACKEND)) == "cli"]
-                api_ideas = [i for i in new_ideas
-                             if _normalise_backend(i.get("planning_backend", DEFAULT_PLANNING_BACKEND)) != "cli"]
-
-                log.info("📋 CLI tasks: %d, API tasks: %d, CLI ideas: %d, API ideas: %d",
-                         len(cli_tasks), len(api_tasks), len(cli_ideas), len(api_ideas))
-
-                # CLI tasks — no budget needed
-                for task in cli_tasks:
-                    log.info("▶️ Starting CLI task: %s", task.get("title", task.get("id")))
+                for task in new_tasks:
+                    log.info("▶️ Starting task: %s", task.get("title", task.get("id")))
                     with status_lock:
                         agent_status["state"] = "processing"
                         agent_status["current_task"] = task.get("title", task.get("id"))
@@ -1365,45 +1550,14 @@ def main():
                     state["processed"].append(task["id"])
                     save_state(state)
 
-                # API tasks — budget gated
-                budget = remaining
-                if api_tasks:
-                    if budget <= 0:
-                        log.warning("⚠️ API limit reached — %d API task(s) queued", len(api_tasks))
-                    else:
-                        for task in api_tasks[:budget]:
-                            log.info("▶️ Starting API task: %s", task.get("title", task.get("id")))
-                            with status_lock:
-                                agent_status["state"] = "processing"
-                                agent_status["current_task"] = task.get("title", task.get("id"))
-                            process_task(task, tasks, state)
-                            state["processed"].append(task["id"])
-                            save_state(state)
-                            budget -= 1
-
-                # CLI ideas — no budget needed
-                for idea in cli_ideas:
-                    log.info("▶️ Starting CLI idea: %s", idea.get("title", idea.get("id")))
+                for idea in new_ideas:
+                    log.info("▶️ Starting idea: %s", idea.get("title", idea.get("id")))
                     with status_lock:
                         agent_status["state"] = "processing"
                         agent_status["current_task"] = idea.get("title", idea.get("id"))
                     process_idea(idea, ideas, state)
                     state["processed"].append(idea["id"])
                     save_state(state)
-
-                # API ideas — budget gated
-                if api_ideas:
-                    if budget <= 0:
-                        log.warning("⚠️ API limit reached — %d API idea(s) queued", len(api_ideas))
-                    else:
-                        for idea in api_ideas[:budget]:
-                            log.info("▶️ Starting API idea: %s", idea.get("title", idea.get("id")))
-                            with status_lock:
-                                agent_status["state"] = "processing"
-                                agent_status["current_task"] = idea.get("title", idea.get("id"))
-                            process_idea(idea, ideas, state)
-                            state["processed"].append(idea["id"])
-                            save_state(state)
             else:
                 log.debug("No new tasks or ideas — sleeping %ds", POLL_INTERVAL)
 

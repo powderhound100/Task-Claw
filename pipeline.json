@@ -1,0 +1,45 @@
+{
+  "program_manager": {
+    "backend": "github_models",
+    "model": "gpt-4o",
+    "max_tokens": 4096,
+    "temperature": 0.3,
+    "note": "Backends: 'github_models' (uses GITHUB_TOKEN), 'anthropic' (uses ANTHROPIC_API_KEY), 'openai_compatible' (set PIPELINE_PM_URL)"
+  },
+  "stages": {
+    "rewrite": {
+      "enabled": true,
+      "timeout": 120,
+      "description": "PM rewrites the raw prompt for clarity before the pipeline starts"
+    },
+    "plan": {
+      "enabled": true,
+      "team": ["claude"],
+      "timeout": 900,
+      "description": "Architect the approach"
+    },
+    "code": {
+      "enabled": true,
+      "team": ["claude"],
+      "timeout": 600,
+      "description": "Implement the plan. WARNING: team size > 1 risks git conflicts."
+    },
+    "test": {
+      "enabled": true,
+      "team": ["claude"],
+      "timeout": 300,
+      "description": "Verify correctness"
+    },
+    "review": {
+      "enabled": true,
+      "team": ["claude"],
+      "timeout": 300,
+      "description": "Security and quality audit"
+    }
+  },
+  "publish": {
+    "enabled": true,
+    "auto_push": true,
+    "block_on_severity": "high"
+  }
+}
