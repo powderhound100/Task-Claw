@@ -380,36 +380,239 @@ def pm_direct_team(stage_name: str, original_prompt: str, context: str,
         return original_prompt
 
 
-def call_program_manager(stage_name: str, original_prompt: str, context: str,
-                          team_outputs: list, pm_cfg: dict) -> str:
+def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
+                     team_outputs: list, pm_cfg: dict) -> dict:
     """
-    PM acts as synthesizer AFTER the team runs: receives all team outputs,
-    picks the best unified result, and writes a handoff brief for the next stage.
-    Falls back to concatenating team outputs on any API failure (non-fatal).
+    PM acts as overseer AFTER the team runs. Instead of just picking/merging,
+    the PM verifies stage output against requirements, flags quality issues,
+    and decides whether to APPROVE (pass to next stage) or REVISE (needs rework).
+
+    Returns {"verdict": "approve"|"revise", "synthesis": str, "handoff": str,
+             "issues": list[str], "full_response": str}
+    Falls back to approve with concatenated outputs on API failure.
     """
     agent_blocks = "\n\n".join(
         f"--- Agent: {name} ---\n{output}" for name, output in team_outputs
     )
-    system_msg = "You are a Program Manager overseeing an AI coding pipeline."
+    system_msg = (
+        "You are a Program Manager overseeing an AI coding pipeline. "
+        "Your job is NOT to simply pick a winner — you oversee quality, verify "
+        "that stage outputs meet requirements, identify gaps or drift from the "
+        "original request, and decide whether the stage passes your quality gate."
+    )
     user_msg = (
         f"Stage: {stage_name}\n"
         f"Original user request: {original_prompt}\n\n"
-        f"{context}\n\n"
+        f"Prior pipeline context:\n{context}\n\n"
         f"The following agents worked on this stage simultaneously:\n\n"
         f"{agent_blocks}\n\n"
-        "Synthesize the best unified result. Then write a clear handoff brief for the next stage.\n"
-        "Return your response in two sections:\n"
-        "## Synthesis\n[the best combined output]\n\n"
-        "## Handoff to next stage\n[precise instructions/context for the next team]"
+        "As the PM overseeing this pipeline, evaluate the stage output(s):\n\n"
+        "1. **Requirements check**: Does the output fully address the original request? "
+        "List any missed requirements or gaps.\n"
+        "2. **Quality check**: Is the output correct, complete, and production-ready? "
+        "Flag any issues, bugs, or incomplete work.\n"
+        "3. **Drift check**: Has the implementation drifted from the plan or prior stage context? "
+        "Note any deviations.\n"
+        "4. **Verdict**: APPROVE if the output meets quality standards, or REVISE if it needs rework.\n\n"
+        "Return your response in these sections:\n"
+        "## Verdict\nAPPROVE or REVISE\n\n"
+        "## Issues\n[bullet list of any problems found, or 'None']\n\n"
+        "## Synthesis\n[the best combined output, incorporating strengths from all agents]\n\n"
+        "## Handoff to next stage\n[precise instructions/context for the next team, "
+        "including any issues the next stage should be aware of]"
     )
 
-    log.info("   PM [synthesize/%s]: combining %d agent output(s)…",
+    log.info("   PM [oversee/%s]: evaluating %d agent output(s)…",
              stage_name, len(team_outputs))
     try:
-        return _pm_api_call(system_msg, user_msg, pm_cfg)
+        result = _pm_api_call(system_msg, user_msg, pm_cfg)
+        return _parse_overseer_response(result)
     except Exception as e:
-        log.warning("⚠️ Program Manager synthesis failed (%s) — concatenating outputs", e)
-        return "\n\n".join(f"## {name}\n{output}" for name, output in team_outputs)
+        log.warning("⚠️ PM oversight failed (%s) — auto-approving with concatenated outputs", e)
+        fallback = "\n\n".join(f"## {name}\n{output}" for name, output in team_outputs)
+        return {
+            "verdict": "approve",
+            "synthesis": fallback,
+            "handoff": fallback,
+            "issues": [],
+            "full_response": fallback,
+        }
+
+
+def _parse_overseer_response(text: str) -> dict:
+    """Parse the PM overseer's structured response into a dict."""
+    result = {
+        "verdict": "approve",
+        "synthesis": "",
+        "handoff": "",
+        "issues": [],
+        "full_response": text,
+    }
+
+    # Extract verdict
+    verdict_m = re.search(r'##\s*Verdict\s*\n\s*(APPROVE|REVISE)', text, re.IGNORECASE)
+    if verdict_m:
+        result["verdict"] = verdict_m.group(1).strip().lower()
+
+    # Extract issues
+    issues_m = re.search(r'##\s*Issues\s*\n(.*?)(?=\n##|\Z)', text, re.DOTALL)
+    if issues_m:
+        issues_text = issues_m.group(1).strip()
+        if issues_text.lower() != "none":
+            result["issues"] = [
+                line.strip().lstrip("-*• ").strip()
+                for line in issues_text.splitlines()
+                if line.strip() and line.strip() not in ("-", "*", "•")
+            ]
+
+    # Extract synthesis
+    synth_m = re.search(r'##\s*Synthesis\s*\n(.*?)(?=\n##|\Z)', text, re.DOTALL)
+    if synth_m:
+        result["synthesis"] = synth_m.group(1).strip()
+
+    # Extract handoff
+    handoff_m = re.search(r'##\s*Handoff[^\n]*\n(.*?)(?=\n##|\Z)', text, re.DOTALL)
+    if handoff_m:
+        result["handoff"] = handoff_m.group(1).strip()
+
+    # Fallback: if no synthesis extracted, use full response
+    if not result["synthesis"]:
+        result["synthesis"] = text
+    if not result["handoff"]:
+        result["handoff"] = result["synthesis"]
+
+    return result
+
+
+def cross_review_code(team_outputs: list, plan_context: str,
+                      original_prompt: str, timeout: int) -> list:
+    """
+    When multiple agents produce code, run a cross-review: each agent reviews
+    the OTHER agent's implementation against the plan.
+
+    Returns list of (reviewer_name, review_output) tuples.
+    Only runs when there are 2+ team outputs.
+    """
+    if len(team_outputs) < 2:
+        return []
+
+    log.info("   🔄 Cross-review: %d implementations to compare",
+             len(team_outputs))
+
+    def _review_other(reviewer_idx: int):
+        reviewer_name, _reviewer_code = team_outputs[reviewer_idx]
+        # Collect all OTHER implementations for this reviewer to examine
+        others = [
+            (name, code) for i, (name, code) in enumerate(team_outputs)
+            if i != reviewer_idx
+        ]
+        other_blocks = "\n\n".join(
+            f"--- Implementation by {name} ---\n{code}" for name, code in others
+        )
+
+        review_prompt = (
+            f"You are reviewing code produced by other agents.\n\n"
+            f"Original request: {original_prompt}\n\n"
+            f"Plan context:\n{plan_context}\n\n"
+            f"Implementations to review:\n\n{other_blocks}\n\n"
+            "Perform a thorough code review. For each implementation:\n"
+            "1. **Correctness**: Does it fulfill the plan and original request?\n"
+            "2. **Gaps**: What requirements or edge cases are missing?\n"
+            "3. **Bugs**: Any logic errors, off-by-one, null checks, etc.?\n"
+            "4. **Strengths**: What does this implementation do particularly well?\n"
+            "5. **Suggestions**: Specific improvements with code snippets where helpful.\n\n"
+            "Be specific and actionable. Reference file names and line numbers where possible."
+        )
+        try:
+            provider = get_provider_for_phase("review", reviewer_name)
+            success, output = run_cli_command(provider, "review", review_prompt)
+            if success and output:
+                return f"review-by-{reviewer_name}", output
+            log.warning("   Cross-review by '%s' failed or empty", reviewer_name)
+            return None
+        except Exception as e:
+            log.warning("   Cross-review by '%s' error: %s", reviewer_name, e)
+            return None
+
+    reviews = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, len(team_outputs))
+    ) as ex:
+        futures = {
+            ex.submit(_review_other, i): team_outputs[i][0]
+            for i in range(len(team_outputs))
+        }
+        for fut in concurrent.futures.as_completed(futures, timeout=timeout + 30):
+            try:
+                res = fut.result()
+                if res:
+                    reviews.append(res)
+            except Exception as e:
+                log.warning("   Cross-review future error: %s", e)
+
+    log.info("   🔄 Cross-review complete: %d reviews collected", len(reviews))
+    return reviews
+
+
+def pm_merge_with_reviews(stage_name: str, original_prompt: str, context: str,
+                          team_outputs: list, cross_reviews: list,
+                          pm_cfg: dict) -> dict:
+    """
+    PM receives both implementations AND cross-reviews, then produces a deep
+    merge that leverages the best parts of each implementation.
+
+    Returns same dict format as pm_oversee_stage().
+    """
+    impl_blocks = "\n\n".join(
+        f"--- Implementation by {name} ---\n{output}"
+        for name, output in team_outputs
+    )
+    review_blocks = "\n\n".join(
+        f"--- {name} ---\n{output}"
+        for name, output in cross_reviews
+    )
+
+    system_msg = (
+        "You are a Program Manager overseeing an AI coding pipeline. "
+        "Multiple agents have produced implementations AND reviewed each other's work. "
+        "Your job is to deeply analyze both implementations, leverage the cross-reviews, "
+        "and produce a merged result that takes the best elements from each."
+    )
+    user_msg = (
+        f"Stage: {stage_name}\n"
+        f"Original user request: {original_prompt}\n\n"
+        f"Prior pipeline context:\n{context}\n\n"
+        f"=== IMPLEMENTATIONS ===\n\n{impl_blocks}\n\n"
+        f"=== CROSS-REVIEWS ===\n\n{review_blocks}\n\n"
+        "Perform a deep merge:\n"
+        "1. **Compare**: What does each implementation do differently? "
+        "Where do they agree vs. diverge?\n"
+        "2. **Gap analysis**: Using the cross-reviews, identify gaps in EACH implementation. "
+        "What did Agent A catch that Agent B missed, and vice versa?\n"
+        "3. **Strength mapping**: What is each implementation's strongest contribution?\n"
+        "4. **Merged result**: Produce the best unified implementation that:\n"
+        "   - Takes the strongest approach for each component\n"
+        "   - Fills gaps identified in the cross-reviews\n"
+        "   - Resolves any contradictions between implementations\n"
+        "5. **Verdict**: APPROVE if the merged result is production-ready, REVISE if not.\n\n"
+        "Return your response in these sections:\n"
+        "## Comparison\n[brief analysis of differences]\n\n"
+        "## Verdict\nAPPROVE or REVISE\n\n"
+        "## Issues\n[remaining problems, or 'None']\n\n"
+        "## Synthesis\n[the merged implementation — this is what gets used]\n\n"
+        "## Handoff to next stage\n[context for the next team]"
+    )
+
+    log.info("   PM [deep-merge/%s]: merging %d implementations with %d cross-reviews…",
+             stage_name, len(team_outputs), len(cross_reviews))
+    try:
+        result = _pm_api_call(system_msg, user_msg, pm_cfg)
+        return _parse_overseer_response(result)
+    except Exception as e:
+        log.warning("⚠️ PM deep-merge failed (%s) — falling back to basic oversight", e)
+        return pm_oversee_stage(
+            stage_name, original_prompt, context, team_outputs, pm_cfg
+        )
 
 
 def run_team(stage_name: str, prompt: str, team_provider_names: list,
@@ -483,15 +686,22 @@ def _cap_context(context: str, max_chars: int = 12000) -> str:
     return "".join(sections)
 
 
+MAX_REVISE_ATTEMPTS = int(os.environ.get("PIPELINE_MAX_REVISE", "1"))
+
+
 def run_pipeline(prompt: str, task_id: str | None = None,
                  pipeline_cfg: dict | None = None,
                  start_stage: str | None = None) -> dict:
     """
     Full pipeline: rewrite → plan → code → test → review → publish.
 
-    The Program Manager acts as director between each stage: it receives all team
-    outputs, synthesizes the best result, and writes a handoff brief that becomes
-    the context injected into the next stage's team prompts.
+    The Program Manager oversees the entire flow:
+    - BEFORE each stage: writes a directed task brief for the team
+    - AFTER each stage: verifies output quality, checks for requirement gaps
+      and drift, and decides APPROVE or REVISE
+    - For the CODE stage with 2+ team members: runs cross-review where each
+      agent reviews the other's implementation, then PM does a deep merge
+      leveraging both solutions and the cross-reviews
 
     start_stage: skip all stages before this one ('plan', 'code', 'test', 'review').
     Returns {"success": bool, "stage_results": {...}, "published": bool, "error": str|None}
@@ -533,6 +743,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
         log.info("   ▶️ Stage: %-8s | team: %s | timeout: %ds", stage, team, timeout)
         with status_lock:
             agent_status["state"] = f"pipeline:{stage}"
+            agent_status["current_stage"] = stage
 
         # ── Rewrite: PM-only, no CLI team ───────────────────────────────────
         if stage == "rewrite":
@@ -541,16 +752,21 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             log.info("   Rewritten prompt (%d chars)", len(prompt))
             continue
 
-        # ── Review: use structured security review, PM synthesizes verdict ──
+        # ── Review: use structured security review, PM oversees verdict ─────
         if stage == "review":
             review = run_security_review(tid, (prompt[:80] or tid))
             team_outputs = [("security-review", review.get("report", "No report."))]
-            pm_result = call_program_manager(
+            pm_result = pm_oversee_stage(
                 stage, original_prompt, context, team_outputs, pm_cfg
             )
-            stage_results["review"] = pm_result
-            context += f"\n\n## REVIEW HANDOFF\n{pm_result}"
+            stage_results["review"] = pm_result["full_response"]
+            context += f"\n\n## REVIEW HANDOFF\n{pm_result['handoff']}"
             context = _cap_context(context)
+
+            if pm_result["issues"]:
+                log.info("   PM flagged %d review issues: %s",
+                         len(pm_result["issues"]),
+                         "; ".join(pm_result["issues"][:3]))
 
             action = _handle_security_findings(
                 review, tid, prompt[:80] or tid, [], False
@@ -565,26 +781,71 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 }
             continue
 
-        # ── Plan / Code / Test: PM directs → team runs in parallel → PM synthesizes ──
-        # PM writes a directed task brief for the team based on all prior context
-        directed_prompt = pm_direct_team(stage, prompt, context, team, pm_cfg)
-        team_outputs = run_team(stage, directed_prompt, team, context, timeout)
+        # ── Plan / Code / Test: PM directs → team runs → PM oversees ────────
+        for attempt in range(1 + MAX_REVISE_ATTEMPTS):
+            directed_prompt = pm_direct_team(stage, prompt, context, team, pm_cfg)
+            team_outputs = run_team(stage, directed_prompt, team, context, timeout)
 
-        if not team_outputs:
-            log.warning("⚠️ Stage '%s' — no team output, continuing", stage)
-            stage_results[stage] = ""
-            continue
+            if not team_outputs:
+                log.warning("⚠️ Stage '%s' — no team output, continuing", stage)
+                stage_results[stage] = ""
+                break
 
-        # After code stage, restart any changed services
-        if stage == "code":
-            _restart_changed_services()
+            # After code stage, restart any changed services
+            if stage == "code":
+                _restart_changed_services()
 
-        pm_result = call_program_manager(
-            stage, original_prompt, context, team_outputs, pm_cfg
-        )
-        stage_results[stage] = pm_result
-        context += f"\n\n## {stage.upper()} HANDOFF\n{pm_result}"
-        context = _cap_context(context)
+            # ── Code stage with 2+ agents: cross-review + deep merge ────────
+            if stage == "code" and len(team_outputs) >= 2:
+                cross_reviews = cross_review_code(
+                    team_outputs, context, original_prompt, timeout
+                )
+                if cross_reviews:
+                    pm_result = pm_merge_with_reviews(
+                        stage, original_prompt, context,
+                        team_outputs, cross_reviews, pm_cfg
+                    )
+                else:
+                    # Cross-review failed, fall back to standard oversight
+                    pm_result = pm_oversee_stage(
+                        stage, original_prompt, context, team_outputs, pm_cfg
+                    )
+            else:
+                # ── Standard oversight for plan/test or single-agent code ───
+                pm_result = pm_oversee_stage(
+                    stage, original_prompt, context, team_outputs, pm_cfg
+                )
+
+            # ── PM quality gate ─────────────────────────────────────────────
+            verdict = pm_result["verdict"]
+            issues = pm_result["issues"]
+
+            if issues:
+                log.info("   PM flagged %d issues in '%s': %s",
+                         len(issues), stage, "; ".join(issues[:3]))
+
+            if verdict == "revise" and attempt < MAX_REVISE_ATTEMPTS:
+                log.warning("   🔄 PM verdict: REVISE (attempt %d/%d) — re-running stage '%s'",
+                            attempt + 1, MAX_REVISE_ATTEMPTS, stage)
+                # Inject the PM's feedback into context so the retry is informed
+                context += (
+                    f"\n\n## PM REVISION REQUEST ({stage})\n"
+                    f"Issues found:\n" +
+                    "\n".join(f"- {iss}" for iss in issues) +
+                    f"\n\nPM guidance:\n{pm_result['handoff']}"
+                )
+                context = _cap_context(context)
+                continue  # retry the stage
+
+            if verdict == "revise":
+                log.warning("   ⚠️ PM verdict: REVISE but max attempts reached — proceeding with best effort")
+
+            # Approved (or max attempts reached) — record and move on
+            stage_results[stage] = pm_result["full_response"]
+            context += f"\n\n## {stage.upper()} HANDOFF\n{pm_result['handoff']}"
+            context = _cap_context(context)
+            log.info("   ✅ PM verdict: %s for stage '%s'", verdict.upper(), stage)
+            break
 
     # ── Publish ──────────────────────────────────────────────────────────────
     published = False
@@ -609,6 +870,7 @@ trigger_event = threading.Event()
 agent_status = {
     "state": "starting",
     "current_task": None,
+    "current_stage": None,
     "last_run": None,
     "last_trigger": None,
     "tasks_pending": 0,
@@ -762,6 +1024,21 @@ class TriggerHandler(BaseHTTPRequestHandler):
             with research_lock:
                 job = research_jobs.get(idea_id, {"status": "idle", "result": None})
             self._json(200, job)
+        elif self.path.startswith("/security-report/"):
+            task_id = self.path.split("/security-report/", 1)[1].rstrip("/")
+            # Look for any file in SECURITY_REVIEW_DIR that starts with the task id
+            report_text = None
+            for candidate in SECURITY_REVIEW_DIR.iterdir():
+                if candidate.stem.startswith(task_id) or task_id in candidate.stem:
+                    try:
+                        report_text = candidate.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
+                    break
+            if report_text is not None:
+                self._json(200, {"ok": True, "report": report_text})
+            else:
+                self._json(404, {"ok": False, "error": "No security report found for this task"})
         else:
             self._json(404, {"ok": False, "error": "Not found"})
 
@@ -1590,6 +1867,7 @@ def main():
             with status_lock:
                 agent_status["state"] = "idle"
                 agent_status["current_task"] = None
+                agent_status["current_stage"] = None
 
         except KeyboardInterrupt:
             log.info("\n👋 Agent stopped by user")

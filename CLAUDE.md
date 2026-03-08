@@ -19,20 +19,29 @@ The entire agent lives in a single file: `task-claw.py`. There are no modules, p
 ```
 User Prompt
     ↓
-[Rewrite] — Program Manager rewrites prompt for clarity
+[Rewrite] — PM rewrites prompt for clarity
     ↓
-[Plan]    — Team of CLIs produce plans → PM synthesizes → unified plan
-    ↓
-[Code]    — Team implements → PM synthesizes → implementation summary
-    ↓
-[Test]    — Team verifies → PM synthesizes → test report
-    ↓
-[Review]  — Structured security audit → PM synthesizes → verdict
+[Plan]    — PM directs → team plans → PM oversees (quality gate)
+    ↓                                  ↺ REVISE if needed
+[Code]    — PM directs → team implements in parallel
+    ↓       → cross-review (each agent reviews the other's code)
+    ↓       → PM deep-merge (compares, finds gaps, merges best parts)
+    ↓       → quality gate (APPROVE / REVISE)
+    ↓                                  ↺ REVISE if needed
+[Test]    — PM directs → team tests → PM oversees (quality gate)
+    ↓                                  ↺ REVISE if needed
+[Review]  — Structured security audit → PM oversees → verdict
     ↓
 [Publish] — git commit + push (blocked if HIGH severity)
 ```
 
-The **Program Manager** is an API call (`call_program_manager()`) that synthesizes parallel team outputs and writes a handoff brief for the next stage. CLI team members are stateless tools. Pipeline is configured in `pipeline.json`.
+The **Program Manager** oversees the entire pipeline as a quality gatekeeper:
+- `pm_direct_team()` — writes task briefs before each stage
+- `pm_oversee_stage()` — verifies output quality, checks for requirement gaps/drift, returns APPROVE or REVISE
+- `cross_review_code()` — when 2+ agents produce code, each reviews the other's implementation
+- `pm_merge_with_reviews()` — deep merge using both implementations + cross-reviews
+
+If the PM returns REVISE, the stage is re-run with feedback (up to `PIPELINE_MAX_REVISE` attempts, default 1). CLI team members are stateless tools. Pipeline is configured in `pipeline.json`.
 
 **Entry points:**
 - `python task-claw.py "prompt"` — run pipeline once, exit
@@ -77,6 +86,7 @@ Key env vars:
 | `AGENT_TRIGGER_PORT` | `8099` | HTTP trigger server port |
 | `PIPELINE_FILE` | `pipeline.json` | Pipeline + PM config |
 | `PIPELINE_MANAGER_TIMEOUT` | `300` | PM API call timeout (seconds) |
+| `PIPELINE_MAX_REVISE` | `1` | Max times PM can send a stage back for rework |
 
 ## HTTP API
 
