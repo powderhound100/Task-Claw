@@ -64,6 +64,8 @@ RESEARCH_DIR = AGENT_DIR / "research-output"
 RESEARCH_DIR.mkdir(exist_ok=True)
 SECURITY_REVIEW_DIR = AGENT_DIR / "security-reviews"
 SECURITY_REVIEW_DIR.mkdir(exist_ok=True)
+PIPELINE_OUTPUT_DIR = AGENT_DIR / "pipeline-output"
+PIPELINE_OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -119,10 +121,21 @@ def get_provider_for_phase(phase: str, task_override: str | None = None) -> dict
     return _get_provider(provider_name)
 
 
-def build_cli_command(provider: dict, phase: str, prompt: str) -> list[str]:
+def _write_prompt_file(prompt: str, task_id: str, stage: str, phase: str) -> Path:
+    """Write the prompt to a temp file and return its path."""
+    task_dir = PIPELINE_OUTPUT_DIR / (task_id or "scratch")
+    task_dir.mkdir(parents=True, exist_ok=True)
+    prompt_file = task_dir / f".prompt-{stage}-{phase}.md"
+    prompt_file.write_text(prompt, encoding="utf-8")
+    return prompt_file
+
+
+def build_cli_command(provider: dict, phase: str, prompt: str,
+                      prompt_file: Path | None = None) -> list[str]:
     """
     Build the full CLI command list from a provider config.
-    Replaces {prompt} placeholder in args with the actual prompt text.
+    Replaces {prompt} placeholder in args with the actual prompt text,
+    and {prompt_file} with the path to a file containing the prompt.
     """
     binary = provider["binary"]
     # Resolve .cmd/.bat/.exe on Windows so subprocess can find it
@@ -144,7 +157,8 @@ def build_cli_command(provider: dict, phase: str, prompt: str) -> list[str]:
         arg_key = "plan_args"
 
     args = list(provider.get(arg_key, ["-p", "{prompt}"]))
-    args = [a.replace("{prompt}", prompt) for a in args]
+    pf_str = str(prompt_file) if prompt_file else ""
+    args = [a.replace("{prompt_file}", pf_str).replace("{prompt}", prompt) for a in args]
 
     return [binary] + sub + args
 
@@ -248,9 +262,10 @@ def _clean_env() -> dict:
 
 
 def run_cli_command(provider: dict, phase: str, prompt: str,
-                    cwd: str | None = None) -> tuple[bool, str]:
+                    cwd: str | None = None,
+                    prompt_file: Path | None = None) -> tuple[bool, str]:
     """Run a CLI provider command. Returns (success, output_text)."""
-    cmd = build_cli_command(provider, phase, prompt)
+    cmd = build_cli_command(provider, phase, prompt, prompt_file=prompt_file)
     timeout = get_timeout(provider, phase)
     work_dir = cwd or str(PROJECT_DIR)
     # Fall back to agent dir if target dir doesn't exist
@@ -283,81 +298,79 @@ def run_cli_command(provider: dict, phase: str, prompt: str,
         return False, str(e)
 
 
-def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict) -> str:
-    """Low-level PM API call. Raises on failure."""
+def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict,
+                  _retries: int = 3, _backoff: float = 2.0) -> str:
+    """Low-level PM API call with retry on 429/5xx. Raises on persistent failure."""
     backend = pm_cfg.get("backend", "github_models")
     model = pm_cfg.get("model", "gpt-4o")
     max_tokens = pm_cfg.get("max_tokens", 4096)
     temperature = pm_cfg.get("temperature", 0.3)
     pm_timeout = int(os.environ.get("PIPELINE_MANAGER_TIMEOUT", "300"))
+    last_err = None
 
+    # Build request params based on backend
     if backend == "github_models":
         if not GITHUB_TOKEN:
             raise ValueError("GITHUB_TOKEN not set")
-        resp = requests.post(
-            GITHUB_MODELS_URL,
-            headers={"Authorization": f"Bearer {GITHUB_TOKEN}",
-                     "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-            timeout=pm_timeout,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        url = GITHUB_MODELS_URL
+        headers = {"Authorization": f"Bearer {GITHUB_TOKEN}",
+                   "Content-Type": "application/json"}
+        body = {"model": model, "temperature": temperature, "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system_msg},
+                             {"role": "user",   "content": user_msg}]}
+        extract = lambda r: r.json()["choices"][0]["message"]["content"]
 
     elif backend == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not set")
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "max_tokens": max_tokens,
-                "system": system_msg,
-                "messages": [{"role": "user", "content": user_msg}],
-            },
-            timeout=pm_timeout,
-        )
-        resp.raise_for_status()
-        return resp.json()["content"][0]["text"]
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                   "Content-Type": "application/json"}
+        body = {"model": model, "max_tokens": max_tokens, "system": system_msg,
+                "messages": [{"role": "user", "content": user_msg}]}
+        extract = lambda r: r.json()["content"][0]["text"]
 
     elif backend == "openai_compatible":
         url = os.environ.get("PIPELINE_PM_URL",
                              "http://localhost:11434/v1/chat/completions")
         key = os.environ.get("PIPELINE_PM_KEY") or os.environ.get("OPENAI_API_KEY", "")
-        resp = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {key}",
-                     "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-            timeout=pm_timeout,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        headers = {"Authorization": f"Bearer {key}",
+                   "Content-Type": "application/json"}
+        body = {"model": model, "temperature": temperature, "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system_msg},
+                             {"role": "user",   "content": user_msg}]}
+        extract = lambda r: r.json()["choices"][0]["message"]["content"]
 
     else:
         raise ValueError(f"Unknown PM backend: {backend}")
+
+    # Retry loop with exponential backoff on 429 / 5xx
+    for attempt in range(_retries + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=pm_timeout)
+            resp.raise_for_status()
+            return extract(resp)
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", 0)
+            if status in (429, 500, 502, 503, 504) and attempt < _retries:
+                wait = _backoff * (2 ** attempt)
+                log.warning("   PM API %d — retrying in %.0fs (attempt %d/%d)",
+                            status, wait, attempt + 1, _retries)
+                time.sleep(wait)
+                last_err = e
+                continue
+            raise
+        except requests.exceptions.Timeout as e:
+            if attempt < _retries:
+                wait = _backoff * (2 ** attempt)
+                log.warning("   PM API timeout — retrying in %.0fs (attempt %d/%d)",
+                            wait, attempt + 1, _retries)
+                time.sleep(wait)
+                last_err = e
+                continue
+            raise
+    raise last_err  # should not reach here, but just in case
 
 
 def pm_direct_team(stage_name: str, original_prompt: str, context: str,
@@ -384,8 +397,19 @@ def pm_direct_team(stage_name: str, original_prompt: str, context: str,
         log.info("   PM brief (%d chars): %s…", len(brief), brief[:300])
         return brief
     except Exception as e:
-        log.warning("⚠️ PM direction failed (%s) — using original prompt", e)
-        return original_prompt
+        log.warning("⚠️ PM direction failed (%s) — building fallback brief", e)
+        # Build a structured fallback that's clear enough for the CLI agent
+        fallback = f"You are working on the '{stage_name}' stage of a pipeline.\n\n"
+        fallback += f"Task:\n{original_prompt}\n"
+        if context:
+            # Include a trimmed version of context without confusing headers
+            clean_ctx = context.replace("## PM REVISION REQUEST", "## Feedback from prior attempt")
+            fallback += f"\nContext from prior stages:\n{clean_ctx[-3000:]}\n"
+        fallback += (
+            f"\nPlease complete the '{stage_name}' stage. "
+            "Produce actionable, complete output. Do NOT ask clarifying questions."
+        )
+        return fallback
 
 
 def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
@@ -445,8 +469,31 @@ def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
             log.info("   Handoff (%d chars): %s…", len(parsed["handoff"]), parsed["handoff"][:200])
         return parsed
     except Exception as e:
-        log.warning("⚠️ PM oversight failed (%s) — auto-approving with concatenated outputs", e)
+        log.warning("⚠️ PM oversight failed (%s) — checking team output quality", e)
         fallback = "\n\n".join(f"## {name}\n{output}" for name, output in team_outputs)
+
+        # Don't auto-approve obviously bad outputs (too short, asks questions back)
+        total_output_len = sum(len(out) for _, out in team_outputs)
+        all_output = " ".join(out.lower() for _, out in team_outputs)
+        looks_confused = (
+            total_output_len < 200
+            or "incomplete" in all_output
+            or "what would you like" in all_output
+            or "could you share" in all_output
+            or "i don't see" in all_output
+        )
+
+        if looks_confused:
+            log.warning("   Team output looks confused (%d chars) — marking as REVISE", total_output_len)
+            return {
+                "verdict": "revise",
+                "synthesis": fallback,
+                "handoff": "Team output was confused or incomplete. Retry with a clearer prompt.",
+                "issues": ["Team output appears to be a clarification question, not actual work."],
+                "full_response": fallback,
+            }
+
+        log.info("   Auto-approving team output (%d chars)", total_output_len)
         return {
             "verdict": "approve",
             "synthesis": fallback,
@@ -633,10 +680,15 @@ def pm_merge_with_reviews(stage_name: str, original_prompt: str, context: str,
 
 
 def run_team(stage_name: str, prompt: str, team_provider_names: list,
-             context: str, timeout: int | None) -> list:
+             context: str, timeout: int | None,
+             task_id: str = "") -> list:
     """
     Run a team of CLI providers in parallel for a pipeline stage.
     Returns list of (provider_name, output) for successful runs only.
+
+    Stage outputs from prior stages are saved to files on disk.
+    The prompt references these files so CLI agents can read full context
+    without cramming everything into the command-line argument.
     """
     phase_map = {
         "rewrite": "plan",
@@ -646,12 +698,38 @@ def run_team(stage_name: str, prompt: str, team_provider_names: list,
         "review":  "review",
     }
     phase = phase_map.get(stage_name, "implement")
-    combined_prompt = f"{context}\n\n{prompt}".strip() if context else prompt
+
+    # Build the prompt: include references to prior stage output files
+    prior_files_note = ""
+    if task_id:
+        task_dir = PIPELINE_OUTPUT_DIR / task_id
+        if task_dir.exists():
+            saved = sorted(task_dir.glob("*.md"))
+            saved = [f for f in saved if not f.name.startswith(".")]
+            if saved:
+                prior_files_note = (
+                    "\n\n## Prior stage outputs (saved on disk — read these files for full context)\n"
+                    + "\n".join(f"- {f}" for f in saved)
+                )
+
+    combined_prompt = prompt
+    if context:
+        combined_prompt = f"{context}\n\n{prompt}"
+    if prior_files_note:
+        combined_prompt += prior_files_note
+    combined_prompt = combined_prompt.strip()
+
+    # Write prompt to file so CLI can read it instead of relying on cmd-line arg
+    prompt_file = None
+    if task_id:
+        prompt_file = _write_prompt_file(combined_prompt, task_id, stage_name, phase)
 
     def _run_one(provider_name: str):
         try:
             provider = get_provider_for_phase(phase, provider_name)
-            success, output = run_cli_command(provider, phase, combined_prompt)
+            success, output = run_cli_command(
+                provider, phase, combined_prompt, prompt_file=prompt_file
+            )
             if success and output:
                 return provider_name, output
             log.warning("   Team member '%s' failed or empty", provider_name)
@@ -706,6 +784,34 @@ def _cap_context(context: str, max_chars: int = 12000) -> str:
 
 
 MAX_REVISE_ATTEMPTS = int(os.environ.get("PIPELINE_MAX_REVISE", "1"))
+
+
+def _save_stage_output(task_id: str, stage: str, content: str,
+                       notes: str = "") -> Path:
+    """Save stage output to pipeline-output/{task_id}/{stage}.md for cross-stage reference."""
+    task_dir = PIPELINE_OUTPUT_DIR / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    out_file = task_dir / f"{stage}.md"
+    header = f"# Pipeline Stage: {stage}\n# Task: {task_id}\n# Saved: {datetime.now().isoformat()}\n\n"
+    if notes:
+        header += f"## Notes\n{notes}\n\n"
+    header += f"## Output\n"
+    out_file.write_text(header + content, encoding="utf-8")
+    log.info("   💾 Stage '%s' output saved → %s (%d chars)", stage, out_file, len(content))
+    return out_file
+
+
+def _load_stage_output(task_id: str, stage: str) -> str | None:
+    """Load a previously saved stage output. Returns None if not found."""
+    out_file = PIPELINE_OUTPUT_DIR / task_id / f"{stage}.md"
+    if out_file.exists():
+        return out_file.read_text(encoding="utf-8")
+    return None
+
+
+def _stage_output_path(task_id: str, stage: str) -> Path:
+    """Return the path where a stage's output file would be."""
+    return PIPELINE_OUTPUT_DIR / task_id / f"{stage}.md"
 
 
 def run_pipeline(prompt: str, task_id: str | None = None,
@@ -774,10 +880,14 @@ def run_pipeline(prompt: str, task_id: str | None = None,
         if stage == "rewrite":
             prompt = rewrite_prompt(original_prompt, pm_cfg)
             stage_results["rewrite"] = prompt
+            _save_stage_output(tid, "rewrite", prompt,
+                               notes="PM-rewritten prompt for clarity.")
             log.info("   Rewritten prompt (%d chars)", len(prompt))
             stage_log.append({"stage": "rewrite", "elapsed": round(time.time() - _stage_start, 1),
                                "verdict": "done", "issues": [], "team": ["pm"],
-                               "note": prompt[:200]})
+                               "note": prompt[:200],
+                               "output": prompt[:2000],
+                               "output_file": str(_stage_output_path(tid, "rewrite"))})
             continue
 
         # ── Review: use structured security review, PM oversees verdict ─────
@@ -788,6 +898,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 stage, original_prompt, context, team_outputs, pm_cfg
             )
             stage_results["review"] = pm_result["full_response"]
+            _save_stage_output(tid, "review", pm_result["full_response"],
+                               notes=f"Verdict: {pm_result['verdict']}")
             context += f"\n\n## REVIEW HANDOFF\n{pm_result['handoff']}"
             context = _cap_context(context)
 
@@ -803,7 +915,9 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                                "verdict": "blocked" if action == "blocked" else pm_result["verdict"],
                                "issues": pm_result.get("issues", []),
                                "team": ["security-review"],
-                               "note": review.get("report", "")[:200]})
+                               "note": review.get("report", "")[:200],
+                               "output": review.get("report", "")[:2000],
+                               "output_file": str(_stage_output_path(tid, "review"))})
             if action == "blocked":
                 log.warning("🔒 Pipeline blocked by security review for: %s", tid)
                 return {
@@ -818,7 +932,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
         # ── Plan / Code / Test: PM directs → team runs → PM oversees ────────
         for attempt in range(1 + MAX_REVISE_ATTEMPTS):
             directed_prompt = pm_direct_team(stage, prompt, context, team, pm_cfg)
-            team_outputs = run_team(stage, directed_prompt, team, context, timeout)
+            team_outputs = run_team(stage, directed_prompt, team, context, timeout,
+                                    task_id=tid)
 
             if not team_outputs:
                 log.warning("⚠️ Stage '%s' — no team output, continuing", stage)
@@ -861,12 +976,14 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             if verdict == "revise" and attempt < MAX_REVISE_ATTEMPTS:
                 log.warning("   🔄 PM verdict: REVISE (attempt %d/%d) — re-running stage '%s'",
                             attempt + 1, MAX_REVISE_ATTEMPTS, stage)
-                # Inject the PM's feedback into context so the retry is informed
+                # Inject PM feedback into context in a CLI-friendly format
+                # (avoid ## headers that confuse CLI agents into thinking
+                # they received a revision request instead of a task)
+                issues_text = "\n".join(f"- {iss}" for iss in issues)
                 context += (
-                    f"\n\n## PM REVISION REQUEST ({stage})\n"
-                    f"Issues found:\n" +
-                    "\n".join(f"- {iss}" for iss in issues) +
-                    f"\n\nPM guidance:\n{pm_result['handoff']}"
+                    f"\n\nThe previous {stage} attempt was rejected. "
+                    f"Issues found:\n{issues_text}\n\n"
+                    f"Guidance for retry:\n{pm_result['handoff']}"
                 )
                 context = _cap_context(context)
                 continue  # retry the stage
@@ -876,13 +993,17 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 
             # Approved (or max attempts reached) — record and move on
             stage_results[stage] = pm_result["full_response"]
+            _save_stage_output(tid, stage, pm_result["full_response"],
+                               notes=f"Verdict: {verdict} | Issues: {len(issues)}")
             context += f"\n\n## {stage.upper()} HANDOFF\n{pm_result['handoff']}"
             context = _cap_context(context)
             elapsed = time.time() - _stage_start
             log.info("   ✅ Stage '%s' done in %.0fs — PM: %s", stage, elapsed, verdict.upper())
             stage_log.append({"stage": stage, "elapsed": round(elapsed, 1),
                                "verdict": verdict, "issues": issues, "team": team,
-                               "note": pm_result.get("handoff", "")[:200]})
+                               "note": pm_result.get("handoff", "")[:200],
+                               "output": pm_result.get("synthesis", "")[:2000],
+                               "output_file": str(_stage_output_path(tid, stage))})
             break
 
     # ── Publish ──────────────────────────────────────────────────────────────
@@ -1063,6 +1184,28 @@ class TriggerHandler(BaseHTTPRequestHandler):
             with research_lock:
                 job = research_jobs.get(idea_id, {"status": "idle", "result": None})
             self._json(200, job)
+        elif self.path.startswith("/pipeline-output/"):
+            # /pipeline-output/{task_id} → list all stage outputs
+            # /pipeline-output/{task_id}/{stage} → single stage output
+            parts = self.path.split("/pipeline-output/", 1)[1].rstrip("/").split("/", 1)
+            task_id = parts[0]
+            stage = parts[1] if len(parts) > 1 else None
+            task_dir = PIPELINE_OUTPUT_DIR / task_id
+            if not task_dir.exists():
+                self._json(404, {"ok": False, "error": "No pipeline output for this task"})
+            elif stage:
+                out_file = task_dir / f"{stage}.md"
+                if out_file.exists():
+                    self._json(200, {"ok": True, "stage": stage,
+                                     "content": out_file.read_text(encoding="utf-8")})
+                else:
+                    self._json(404, {"ok": False, "error": f"No output for stage '{stage}'"})
+            else:
+                files = {}
+                for f in sorted(task_dir.glob("*.md")):
+                    if not f.name.startswith("."):
+                        files[f.stem] = f.read_text(encoding="utf-8")
+                self._json(200, {"ok": True, "task_id": task_id, "stages": files})
         elif self.path.startswith("/security-report/"):
             task_id = self.path.split("/security-report/", 1)[1].rstrip("/")
             # Look for any file in SECURITY_REVIEW_DIR that starts with the task id
@@ -1740,6 +1883,14 @@ def process_task(task: dict, tasks: list, state: dict):
     result = run_pipeline(prompt, task_id=task_id)
 
     plan_text = result.get("stage_results", {}).get("plan", "")
+    # Collect output file paths for each stage
+    output_files = {}
+    task_output_dir = PIPELINE_OUTPUT_DIR / task_id
+    if task_output_dir.exists():
+        for f in sorted(task_output_dir.glob("*.md")):
+            if not f.name.startswith("."):
+                output_files[f.stem] = str(f)
+
     for t in tasks:
         if t.get("id") == task_id:
             if plan_text:
@@ -1752,6 +1903,8 @@ def process_task(task: dict, tasks: list, state: dict):
                 "published": result.get("published", False),
                 "success": result.get("success", False),
                 "ran_at": datetime.now().isoformat(),
+                "output_files": output_files,
+                "output_dir": str(task_output_dir),
             }
             t["updated"] = _ts_ms()
             break

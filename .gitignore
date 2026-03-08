@@ -3,5 +3,6 @@ agent-state.json
 agent.log
 research-output/
 security-reviews/
+pipeline-output/
 __pycache__/
 *.pyc
