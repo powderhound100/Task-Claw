@@ -675,10 +675,13 @@ class TriggerHandler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "message": "Pipeline started!",
                                  "prompt": prompt[:100]})
                 return
+            force = body.get("force") if body else False
             trigger_event.set()
             with status_lock:
                 agent_status["last_trigger"] = datetime.now().isoformat()
-            log.info("🚨 Manual trigger received — waking agent!")
+                if force:
+                    agent_status["force_no_age_filter"] = True
+            log.info("🚨 Manual trigger received — waking agent!%s", " (force=no age filter)" if force else "")
             self._json(200, {"ok": True, "message": "Agent triggered!"})
 
         elif self.path.startswith("/implement/"):
@@ -1528,11 +1531,19 @@ def main():
         try:
             state = load_state()
 
+            # Check if force trigger requested (skip age filter)
+            with status_lock:
+                skip_age_filter = agent_status.pop("force_no_age_filter", False)
+
+            max_age_ms = int(os.environ.get("AGENT_MAX_TASK_AGE_HOURS", "8")) * 3600 * 1000
+            cutoff_ms = _ts_ms() - max_age_ms
+
             tasks = load_tasks()
             new_tasks = [
                 t for t in tasks
                 if t.get("id") and t["id"] not in state["processed"]
                 and t.get("status", "open") == "open"
+                and (skip_age_filter or (t.get("created") or t.get("updated") or 0) >= cutoff_ms)
             ] if tasks else []
 
             ideas = load_ideas()
@@ -1540,6 +1551,7 @@ def main():
                 i for i in ideas
                 if i.get("id") and i["id"] not in state["processed"]
                 and i.get("status", "open") == "open"
+                and (skip_age_filter or (i.get("created") or i.get("updated") or 0) >= cutoff_ms)
             ] if ideas else []
 
             with status_lock:

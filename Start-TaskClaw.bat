@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 title Task-Claw Agent
 echo ======================================
 echo   Task-Claw Coding Agent
@@ -29,5 +30,9 @@ for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0.env") do (
 )
 
 cd /d "%~dp0"
+echo Starting Task-Claw agent (port 8099)...
+echo.
 python task-claw.py
-pause
+echo.
+echo Task-Claw exited. Press any key to close.
+pause >nul
