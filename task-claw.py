@@ -732,6 +732,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 
     context = ""
     stage_results: dict = {}
+    stage_log: list = []          # summary entry per stage
+    pipeline_start = time.time()
     original_prompt = prompt
     tid = task_id or f"pipeline-{int(time.time())}"
 
@@ -773,6 +775,9 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             prompt = rewrite_prompt(original_prompt, pm_cfg)
             stage_results["rewrite"] = prompt
             log.info("   Rewritten prompt (%d chars)", len(prompt))
+            stage_log.append({"stage": "rewrite", "elapsed": round(time.time() - _stage_start, 1),
+                               "verdict": "done", "issues": [], "team": ["pm"],
+                               "note": prompt[:200]})
             continue
 
         # ── Review: use structured security review, PM oversees verdict ─────
@@ -794,11 +799,17 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             action = _handle_security_findings(
                 review, tid, prompt[:80] or tid, [], False
             )
+            stage_log.append({"stage": "review", "elapsed": round(time.time() - _stage_start, 1),
+                               "verdict": "blocked" if action == "blocked" else pm_result["verdict"],
+                               "issues": pm_result.get("issues", []),
+                               "team": ["security-review"],
+                               "note": review.get("report", "")[:200]})
             if action == "blocked":
                 log.warning("🔒 Pipeline blocked by security review for: %s", tid)
                 return {
                     "success": False,
                     "stage_results": stage_results,
+                    "stage_log": stage_log,
                     "published": False,
                     "error": "Blocked by security review (HIGH severity)",
                 }
@@ -869,6 +880,9 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             context = _cap_context(context)
             elapsed = time.time() - _stage_start
             log.info("   ✅ Stage '%s' done in %.0fs — PM: %s", stage, elapsed, verdict.upper())
+            stage_log.append({"stage": stage, "elapsed": round(elapsed, 1),
+                               "verdict": verdict, "issues": issues, "team": team,
+                               "note": pm_result.get("handoff", "")[:200]})
             break
 
     # ── Publish ──────────────────────────────────────────────────────────────
@@ -882,7 +896,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
         agent_status["state"] = "idle"
 
     log.info("✅ Pipeline complete for: %s (published=%s)", tid, published)
-    return {"success": True, "stage_results": stage_results,
+    return {"success": True, "stage_results": stage_results, "stage_log": stage_log,
+            "pipeline_elapsed": round(time.time() - pipeline_start, 1),
             "published": published, "error": None}
 
 
@@ -1731,6 +1746,13 @@ def process_task(task: dict, tasks: list, state: dict):
                 t["plan"] = plan_text
                 t["planning_completed_at"] = datetime.now().isoformat()
             t["implementation_completed_at"] = datetime.now().isoformat()
+            t["pipeline_summary"] = {
+                "stages": result.get("stage_log", []),
+                "elapsed": result.get("pipeline_elapsed", 0),
+                "published": result.get("published", False),
+                "success": result.get("success", False),
+                "ran_at": datetime.now().isoformat(),
+            }
             t["updated"] = _ts_ms()
             break
     save_tasks(tasks)
