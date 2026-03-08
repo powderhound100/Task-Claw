@@ -266,11 +266,13 @@ def run_cli_command(provider: dict, phase: str, prompt: str,
             capture_output=True, text=True, timeout=timeout,
             env=_clean_env(), encoding="utf-8", errors="replace",
         )
-        log.info("   Exit code: %d", result.returncode)
-        if result.stdout:
-            log.debug("   Stdout tail: %s", result.stdout[-1000:])
-        if result.stderr:
-            log.warning("   Stderr tail: %s", result.stderr[-500:])
+        log.info("   Exit code: %d | output: %d chars", result.returncode, len(result.stdout or ""))
+        if result.stdout and result.stdout.strip():
+            out = result.stdout.strip()
+            snippet = out[:500] + ("\n…[truncated]" if len(out) > 500 else "")
+            log.info("   Output preview:\n%s", snippet)
+        if result.stderr and result.stderr.strip():
+            log.warning("   Stderr: %s", result.stderr.strip()[-500:])
         output = result.stdout.strip() if result.stdout else result.stderr.strip()
         return result.returncode == 0, output
     except subprocess.TimeoutExpired:
@@ -378,7 +380,9 @@ def pm_direct_team(stage_name: str, original_prompt: str, context: str,
     )
     log.info("   PM [direct/%s]: generating task brief for team %s…", stage_name, team)
     try:
-        return _pm_api_call(system_msg, user_msg, pm_cfg)
+        brief = _pm_api_call(system_msg, user_msg, pm_cfg)
+        log.info("   PM brief (%d chars): %s…", len(brief), brief[:300])
+        return brief
     except Exception as e:
         log.warning("⚠️ PM direction failed (%s) — using original prompt", e)
         return original_prompt
@@ -426,11 +430,20 @@ def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
         "including any issues the next stage should be aware of]"
     )
 
+    for name, output in team_outputs:
+        log.info("   Agent output [%s]: %d chars", name, len(output))
     log.info("   PM [oversee/%s]: evaluating %d agent output(s)…",
              stage_name, len(team_outputs))
     try:
         result = _pm_api_call(system_msg, user_msg, pm_cfg)
-        return _parse_overseer_response(result)
+        parsed = _parse_overseer_response(result)
+        log.info("   PM verdict: %s | issues: %d", parsed["verdict"].upper(), len(parsed.get("issues", [])))
+        if parsed.get("issues"):
+            for issue in parsed["issues"]:
+                log.info("     ⚠️  %s", issue)
+        if parsed.get("handoff"):
+            log.info("   Handoff (%d chars): %s…", len(parsed["handoff"]), parsed["handoff"][:200])
+        return parsed
     except Exception as e:
         log.warning("⚠️ PM oversight failed (%s) — auto-approving with concatenated outputs", e)
         fallback = "\n\n".join(f"## {name}\n{output}" for name, output in team_outputs)
@@ -671,10 +684,12 @@ def rewrite_prompt(raw_prompt: str, pm_cfg: dict) -> str:
         "Return only the rewritten prompt — no explanation, no preamble.\n\n"
         f"Original request:\n{raw_prompt}"
     )
-    log.info("   PM [rewrite]: clarifying prompt…")
+    log.info("   PM [rewrite]: clarifying prompt (%d chars)…", len(raw_prompt))
     try:
         result = _pm_api_call(system_msg, user_msg, pm_cfg)
-        return result.strip() or raw_prompt
+        rewritten = result.strip() or raw_prompt
+        log.info("   Rewritten prompt (%d chars): %s…", len(rewritten), rewritten[:300])
+        return rewritten
     except Exception as e:
         log.warning("⚠️ PM rewrite failed (%s) — using original prompt", e)
         return raw_prompt
@@ -746,7 +761,9 @@ def run_pipeline(prompt: str, task_id: str | None = None,
         team = stage_cfg.get("team", ["claude"])
 
         timeout_label = f"{timeout}s" if timeout else "no timeout"
+        log.info("─" * 50)
         log.info("   ▶️ Stage: %-8s | team: %s | timeout: %s", stage, team, timeout_label)
+        _stage_start = time.time()
         with status_lock:
             agent_status["state"] = f"pipeline:{stage}"
             agent_status["current_stage"] = stage
@@ -850,7 +867,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             stage_results[stage] = pm_result["full_response"]
             context += f"\n\n## {stage.upper()} HANDOFF\n{pm_result['handoff']}"
             context = _cap_context(context)
-            log.info("   ✅ PM verdict: %s for stage '%s'", verdict.upper(), stage)
+            elapsed = time.time() - _stage_start
+            log.info("   ✅ Stage '%s' done in %.0fs — PM: %s", stage, elapsed, verdict.upper())
             break
 
     # ── Publish ──────────────────────────────────────────────────────────────
