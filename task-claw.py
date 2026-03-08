@@ -690,13 +690,10 @@ def pm_merge_with_reviews(stage_name: str, original_prompt: str, context: str,
         )
 
 
-_NON_INTERACTIVE_HEADER = (
-    "AUTOMATED PIPELINE — NON-INTERACTIVE MODE\n"
-    "You are running as part of an automated coding pipeline. "
-    "You MUST produce actionable output — code, plans, test results, etc.\n"
-    "Do NOT ask clarifying questions. Do NOT say the prompt is incomplete. "
-    "Do NOT ask what the user wants. Work with the information provided "
-    "and use your best judgment.\n\n"
+_NON_INTERACTIVE_FOOTER = (
+    "\n\nIMPORTANT: This is an automated pipeline. "
+    "Do NOT ask clarifying questions or say you need more info. "
+    "Produce actionable output immediately."
 )
 
 
@@ -733,9 +730,9 @@ def run_team(stage_name: str, prompt: str, team_provider_names: list,
                     + "\n".join(f"- {f}" for f in saved)
                 )
 
-    combined_prompt = _NON_INTERACTIVE_HEADER + prompt
+    combined_prompt = prompt + _NON_INTERACTIVE_FOOTER
     if context:
-        combined_prompt = _NON_INTERACTIVE_HEADER + f"{context}\n\n{prompt}"
+        combined_prompt = f"{prompt}\n\n{context}" + _NON_INTERACTIVE_FOOTER
     if prior_files_note:
         combined_prompt += prior_files_note
     combined_prompt = combined_prompt.strip()
@@ -819,44 +816,57 @@ def _pm_health_check(pm_cfg: dict) -> bool:
 def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
     """
     Build a self-contained, actionable prompt for a CLI agent when the PM is unavailable.
-    This is the key fallback: instead of just passing the raw task description
-    (which makes the CLI ask clarification questions), we wrap it with clear instructions.
+    Task goes FIRST so Claude engages with it immediately.
     """
     stage_instructions = {
         "plan": (
-            "You are working on the PLAN stage of an automated pipeline. "
-            "Analyze the codebase and the task below. Read relevant files to understand "
-            "the current implementation. Create a detailed implementation plan that lists:\n"
+            "Search the codebase for files related to this task. "
+            "Read those files. Then create a detailed implementation plan listing:\n"
             "1. Which files need to be changed\n"
             "2. What specific changes to make in each file\n"
             "3. The order of operations\n"
-            "Output a concrete, actionable plan.\n\n"
         ),
         "code": (
-            "You are working on the CODE stage of an automated pipeline. "
-            "Implement the changes described below. Read the relevant files in the codebase, "
-            "understand the current implementation, make the necessary code changes, "
-            "and save them. Use your best judgment to implement a complete solution.\n\n"
+            "Read the relevant files in the codebase. "
+            "Make the necessary code changes and save them. "
+            "Implement a complete solution.\n"
         ),
         "test": (
-            "You are working on the TEST stage of an automated pipeline. "
-            "Check git diff to see what changes were made. Verify the changes work correctly "
-            "by reading the modified files. Run any existing tests if applicable. "
-            "If there are issues, fix them. Report what you tested and the results.\n\n"
+            "Run git diff to see what changes were made. "
+            "Read the modified files and verify the changes work. "
+            "Run any existing tests. Fix any issues you find. "
+            "Report what you tested and the results.\n"
         ),
     }
 
-    instruction = stage_instructions.get(stage, f"You are working on the '{stage}' stage. ")
-    parts = [instruction, f"Task:\n{original_prompt}\n"]
+    instruction = stage_instructions.get(stage, f"Complete the '{stage}' stage. ")
+
+    # Task FIRST, then instructions
+    parts = [f"Task: {original_prompt}\n", instruction]
 
     if context:
-        # Clean up any old-format headers that might confuse agents
         clean = re.sub(r'## [A-Z]+ HANDOFF\n(?:## \w+\n)?', '', context)
         clean = clean.strip()
         if clean:
-            parts.append(f"\nContext from prior stages:\n{clean[-4000:]}\n")
+            parts.append(f"\nPrior stage output:\n{clean[-4000:]}\n")
 
     return "\n".join(parts)
+
+
+def _test_found_failures(test_output: str) -> bool:
+    """Check if test stage output indicates failures that need code fixes."""
+    lower = test_output.lower()
+    failure_patterns = [
+        "fail", "error", "broken", "bug", "exception", "traceback",
+        "assert", "not working", "does not work", "crash", "undefined",
+        "typeerror", "syntaxerror", "referenceerror", "attributeerror",
+        "fix needed", "needs fix", "issue found", "issues found",
+    ]
+    # Don't trigger on "no failures" or "all tests passed"
+    pass_patterns = ["no fail", "no error", "all pass", "tests pass", "0 fail"]
+    if any(pp in lower for pp in pass_patterns):
+        return False
+    return any(fp in lower for fp in failure_patterns)
 
 
 def _save_stage_output(task_id: str, stage: str, content: str,
@@ -1044,6 +1054,34 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                                    notes="Direct mode — no PM oversight.")
                 context += f"\n\n=== {stage.capitalize()} stage output ===\n{combined[-3000:]}\n=== End {stage} ==="
                 context = _cap_context(context)
+
+                # ── Test→Code loopback: if test found failures, re-run code ──
+                if stage == "test" and _test_found_failures(combined):
+                    log.warning("   🔄 Test found failures — looping back to code stage")
+                    code_team = stages_cfg.get("code", {}).get("team", ["claude"])
+                    code_timeout_val = int(os.environ.get("PIPELINE_CODE_TIMEOUT",
+                                          str(stages_cfg.get("code", {}).get("timeout", 300))))
+                    code_timeout = None if code_timeout_val == 0 else code_timeout_val
+                    fix_prompt = (
+                        f"Task: {prompt}\n\n"
+                        f"The test stage found these failures. Fix them:\n{combined[-3000:]}\n"
+                        "Read the failing files, fix the issues, and save your changes."
+                    )
+                    fix_outputs = run_team("code", fix_prompt, code_team, "",
+                                          code_timeout, task_id=tid)
+                    if fix_outputs:
+                        _restart_changed_services()
+                        fix_combined = "\n\n".join(out for _, out in fix_outputs)
+                        _save_stage_output(tid, "code-fix", fix_combined,
+                                           notes="Code fix after test failures.")
+                        context += f"\n\n=== Code fix output ===\n{fix_combined[-2000:]}\n=== End code fix ==="
+                        context = _cap_context(context)
+                        stage_log.append({"stage": "code-fix", "elapsed": 0,
+                                          "verdict": "direct", "issues": [],
+                                          "team": code_team,
+                                          "note": fix_combined[:200],
+                                          "output": fix_combined[:2000],
+                                          "output_file": str(_stage_output_path(tid, "code-fix"))})
 
             elapsed = time.time() - _stage_start
             log.info("   ✅ Stage '%s' done in %.0fs — DIRECT", stage, elapsed)
