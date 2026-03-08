@@ -620,7 +620,7 @@ def pm_merge_with_reviews(stage_name: str, original_prompt: str, context: str,
 
 
 def run_team(stage_name: str, prompt: str, team_provider_names: list,
-             context: str, timeout: int) -> list:
+             context: str, timeout: int | None) -> list:
     """
     Run a team of CLI providers in parallel for a pipeline stage.
     Returns list of (provider_name, output) for successful runs only.
@@ -738,13 +738,15 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             log.info("   ⏭️ Stage '%s' disabled", stage)
             continue
 
-        timeout = int(os.environ.get(
+        _t = int(os.environ.get(
             f"PIPELINE_{stage.upper()}_TIMEOUT",
             str(stage_cfg.get("timeout", 300))
         ))
+        timeout = None if _t == 0 else _t
         team = stage_cfg.get("team", ["claude"])
 
-        log.info("   ▶️ Stage: %-8s | team: %s | timeout: %ds", stage, team, timeout)
+        timeout_label = f"{timeout}s" if timeout else "no timeout"
+        log.info("   ▶️ Stage: %-8s | team: %s | timeout: %s", stage, team, timeout_label)
         with status_lock:
             agent_status["state"] = f"pipeline:{stage}"
             agent_status["current_stage"] = stage
