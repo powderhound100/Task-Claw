@@ -786,6 +786,58 @@ def _cap_context(context: str, max_chars: int = 12000) -> str:
 MAX_REVISE_ATTEMPTS = int(os.environ.get("PIPELINE_MAX_REVISE", "1"))
 
 
+def _pm_health_check(pm_cfg: dict) -> bool:
+    """Quick check if the PM backend is reachable. Returns True if healthy."""
+    try:
+        _pm_api_call(
+            "You are a health check.",
+            "Reply with exactly: OK",
+            pm_cfg, _retries=1, _backoff=1.0
+        )
+        return True
+    except Exception as e:
+        log.warning("⚠️ PM health check failed: %s", e)
+        return False
+
+
+def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
+    """
+    Build a self-contained, actionable prompt for a CLI agent when the PM is unavailable.
+    This is the key fallback: instead of just passing the raw task description
+    (which makes the CLI ask clarification questions), we wrap it with clear instructions.
+    """
+    stage_instructions = {
+        "plan": (
+            "You are working on the PLAN stage. Analyze the following task and create a detailed "
+            "implementation plan. List the files that need to be changed, what changes to make, "
+            "and the order of operations. Output a concrete, actionable plan — do NOT ask questions.\n\n"
+        ),
+        "code": (
+            "You are working on the CODE stage. Implement the changes described below. "
+            "Read the relevant files, make the necessary code changes, and save them. "
+            "Do NOT ask clarifying questions — use your best judgment and implement the solution.\n\n"
+        ),
+        "test": (
+            "You are working on the TEST stage. Review the recent changes made to the codebase "
+            "(check git diff) and verify they work correctly. Run any existing tests. "
+            "If there are issues, fix them. Report what you tested and the results.\n\n"
+        ),
+    }
+
+    instruction = stage_instructions.get(stage, f"You are working on the '{stage}' stage. ")
+    prompt = instruction + f"Task:\n{original_prompt}\n"
+
+    if context:
+        # Include context but clean up any confusing headers
+        clean = context.replace("## PLAN HANDOFF\n## claude\n", "## Previous Stage Output\n")
+        clean = clean.replace("## CODE HANDOFF\n## claude\n", "## Previous Stage Output\n")
+        clean = clean.replace("## TEST HANDOFF\n## claude\n", "## Previous Stage Output\n")
+        prompt += f"\nContext from prior stages:\n{clean[-4000:]}\n"
+
+    prompt += "\nIMPORTANT: Do NOT ask clarifying questions. Execute the task directly."
+    return prompt
+
+
 def _save_stage_output(task_id: str, stage: str, content: str,
                        notes: str = "") -> Path:
     """Save stage output to pipeline-output/{task_id}/{stage}.md for cross-stage reference."""
@@ -846,7 +898,15 @@ def run_pipeline(prompt: str, task_id: str | None = None,
     STAGE_ORDER = ["rewrite", "plan", "code", "test", "review"]
     skip = bool(start_stage)
 
-    log.info("🚀 Pipeline starting for: %s (start_stage=%s)", tid, start_stage or "rewrite")
+    # ── PM health check — decide if we run with PM or in direct mode ─────
+    pm_available = _pm_health_check(pm_cfg)
+    if not pm_available:
+        log.warning("⚠️ PM backend unavailable — running pipeline in DIRECT mode (no PM oversight)")
+    else:
+        log.info("✅ PM backend healthy")
+
+    log.info("🚀 Pipeline starting for: %s (start_stage=%s, pm=%s)",
+             tid, start_stage or "rewrite", "yes" if pm_available else "DIRECT")
 
     for stage in STAGE_ORDER:
         if skip:
@@ -878,13 +938,16 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 
         # ── Rewrite: PM-only, no CLI team ───────────────────────────────────
         if stage == "rewrite":
-            prompt = rewrite_prompt(original_prompt, pm_cfg)
+            if pm_available:
+                prompt = rewrite_prompt(original_prompt, pm_cfg)
+            else:
+                log.info("   [DIRECT] Skipping PM rewrite — using original prompt")
             stage_results["rewrite"] = prompt
             _save_stage_output(tid, "rewrite", prompt,
-                               notes="PM-rewritten prompt for clarity.")
+                               notes="PM-rewritten prompt for clarity." if pm_available else "Direct mode — original prompt.")
             log.info("   Rewritten prompt (%d chars)", len(prompt))
             stage_log.append({"stage": "rewrite", "elapsed": round(time.time() - _stage_start, 1),
-                               "verdict": "done", "issues": [], "team": ["pm"],
+                               "verdict": "done", "issues": [], "team": ["pm" if pm_available else "direct"],
                                "note": prompt[:200],
                                "output": prompt[:2000],
                                "output_file": str(_stage_output_path(tid, "rewrite"))})
@@ -929,7 +992,37 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 }
             continue
 
-        # ── Plan / Code / Test: PM directs → team runs → PM oversees ────────
+        # ── Plan / Code / Test ─────────────────────────────────────────────
+        if not pm_available:
+            # ── DIRECT mode: no PM, send actionable prompts straight to CLI ──
+            direct_prompt = _build_direct_prompt(stage, prompt, context)
+            log.info("   [DIRECT] Built prompt for '%s' (%d chars)", stage, len(direct_prompt))
+            team_outputs = run_team(stage, direct_prompt, team, "",
+                                    timeout, task_id=tid)
+
+            if not team_outputs:
+                log.warning("⚠️ Stage '%s' — no team output, continuing", stage)
+                stage_results[stage] = ""
+            else:
+                if stage == "code":
+                    _restart_changed_services()
+                combined = "\n\n".join(out for _, out in team_outputs)
+                stage_results[stage] = combined
+                _save_stage_output(tid, stage, combined,
+                                   notes="Direct mode — no PM oversight.")
+                context += f"\n\n{stage.upper()} output:\n{combined[-3000:]}"
+                context = _cap_context(context)
+
+            elapsed = time.time() - _stage_start
+            log.info("   ✅ Stage '%s' done in %.0fs — DIRECT", stage, elapsed)
+            stage_log.append({"stage": stage, "elapsed": round(elapsed, 1),
+                               "verdict": "direct", "issues": [], "team": team,
+                               "note": (stage_results.get(stage) or "")[:200],
+                               "output": (stage_results.get(stage) or "")[:2000],
+                               "output_file": str(_stage_output_path(tid, stage))})
+            continue
+
+        # ── Full PM mode: PM directs → team runs → PM oversees ───────────
         for attempt in range(1 + MAX_REVISE_ATTEMPTS):
             directed_prompt = pm_direct_team(stage, prompt, context, team, pm_cfg)
             team_outputs = run_team(stage, directed_prompt, team, context, timeout,
