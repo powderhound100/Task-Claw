@@ -374,11 +374,13 @@ def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict,
 
 
 def pm_direct_team(stage_name: str, original_prompt: str, context: str,
-                   team: list, pm_cfg: dict) -> str:
+                   team: list, pm_cfg: dict) -> tuple[str, bool]:
     """
     PM acts as director BEFORE the team runs: given the stage, request, and all
     prior context, it writes a precise task brief for the team to execute.
-    Falls back to the original prompt on failure.
+    Falls back to a structured direct prompt on failure.
+
+    Returns (brief, pm_succeeded).
     """
     system_msg = "You are a Program Manager directing an AI coding team."
     user_msg = (
@@ -395,21 +397,10 @@ def pm_direct_team(stage_name: str, original_prompt: str, context: str,
     try:
         brief = _pm_api_call(system_msg, user_msg, pm_cfg)
         log.info("   PM brief (%d chars): %s…", len(brief), brief[:300])
-        return brief
+        return brief, True
     except Exception as e:
-        log.warning("⚠️ PM direction failed (%s) — building fallback brief", e)
-        # Build a structured fallback that's clear enough for the CLI agent
-        fallback = f"You are working on the '{stage_name}' stage of a pipeline.\n\n"
-        fallback += f"Task:\n{original_prompt}\n"
-        if context:
-            # Include a trimmed version of context without confusing headers
-            clean_ctx = context.replace("## PM REVISION REQUEST", "## Feedback from prior attempt")
-            fallback += f"\nContext from prior stages:\n{clean_ctx[-3000:]}\n"
-        fallback += (
-            f"\nPlease complete the '{stage_name}' stage. "
-            "Produce actionable, complete output. Do NOT ask clarifying questions."
-        )
-        return fallback
+        log.warning("⚠️ PM direction failed (%s) — building direct prompt", e)
+        return _build_direct_prompt(stage_name, original_prompt, context), False
 
 
 def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
@@ -458,9 +449,51 @@ def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
         log.info("   Agent output [%s]: %d chars", name, len(output))
     log.info("   PM [oversee/%s]: evaluating %d agent output(s)…",
              stage_name, len(team_outputs))
+    # ── First: check team output for obvious garbage BEFORE calling PM ─────
+    total_output_len = sum(len(out) for _, out in team_outputs)
+    all_output = " ".join(out.lower() for _, out in team_outputs)
+    garbage_patterns = [
+        "what would you like",
+        "could you share",
+        "could you describe",
+        "could you provide",
+        "please describe",
+        "please provide",
+        "i don't see",
+        "i don't have",
+        "what bug are you",
+        "message might be incomplete",
+        "message got cut off",
+        "plan handoff",
+        "no plan content",
+        "what do you want",
+        "how can i help",
+        "can you clarify",
+        "more information",
+        "more details",
+    ]
+    looks_garbage = (
+        total_output_len < 200
+        or any(pat in all_output for pat in garbage_patterns)
+    )
+
+    if looks_garbage:
+        log.warning("   ❌ Team output is garbage (%d chars, matches patterns) — REVISE",
+                     total_output_len)
+        fallback = "\n\n".join(f"## {name}\n{output}" for name, output in team_outputs)
+        return {
+            "verdict": "revise",
+            "synthesis": fallback,
+            "handoff": "Team output was garbage — agent asked questions or gave no content.",
+            "issues": ["Team output is a clarification question, not actual work."],
+            "full_response": fallback,
+            "pm_succeeded": False,
+        }
+
     try:
         result = _pm_api_call(system_msg, user_msg, pm_cfg)
         parsed = _parse_overseer_response(result)
+        parsed["pm_succeeded"] = True
         log.info("   PM verdict: %s | issues: %d", parsed["verdict"].upper(), len(parsed.get("issues", [])))
         if parsed.get("issues"):
             for issue in parsed["issues"]:
@@ -469,37 +502,15 @@ def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
             log.info("   Handoff (%d chars): %s…", len(parsed["handoff"]), parsed["handoff"][:200])
         return parsed
     except Exception as e:
-        log.warning("⚠️ PM oversight failed (%s) — checking team output quality", e)
+        log.warning("⚠️ PM oversight failed (%s) — auto-approving (output passed garbage check)", e)
         fallback = "\n\n".join(f"## {name}\n{output}" for name, output in team_outputs)
-
-        # Don't auto-approve obviously bad outputs (too short, asks questions back)
-        total_output_len = sum(len(out) for _, out in team_outputs)
-        all_output = " ".join(out.lower() for _, out in team_outputs)
-        looks_confused = (
-            total_output_len < 200
-            or "incomplete" in all_output
-            or "what would you like" in all_output
-            or "could you share" in all_output
-            or "i don't see" in all_output
-        )
-
-        if looks_confused:
-            log.warning("   Team output looks confused (%d chars) — marking as REVISE", total_output_len)
-            return {
-                "verdict": "revise",
-                "synthesis": fallback,
-                "handoff": "Team output was confused or incomplete. Retry with a clearer prompt.",
-                "issues": ["Team output appears to be a clarification question, not actual work."],
-                "full_response": fallback,
-            }
-
-        log.info("   Auto-approving team output (%d chars)", total_output_len)
         return {
             "verdict": "approve",
             "synthesis": fallback,
             "handoff": fallback,
             "issues": [],
             "full_response": fallback,
+            "pm_succeeded": False,
         }
 
 
@@ -679,6 +690,16 @@ def pm_merge_with_reviews(stage_name: str, original_prompt: str, context: str,
         )
 
 
+_NON_INTERACTIVE_HEADER = (
+    "AUTOMATED PIPELINE — NON-INTERACTIVE MODE\n"
+    "You are running as part of an automated coding pipeline. "
+    "You MUST produce actionable output — code, plans, test results, etc.\n"
+    "Do NOT ask clarifying questions. Do NOT say the prompt is incomplete. "
+    "Do NOT ask what the user wants. Work with the information provided "
+    "and use your best judgment.\n\n"
+)
+
+
 def run_team(stage_name: str, prompt: str, team_provider_names: list,
              context: str, timeout: int | None,
              task_id: str = "") -> list:
@@ -712,9 +733,9 @@ def run_team(stage_name: str, prompt: str, team_provider_names: list,
                     + "\n".join(f"- {f}" for f in saved)
                 )
 
-    combined_prompt = prompt
+    combined_prompt = _NON_INTERACTIVE_HEADER + prompt
     if context:
-        combined_prompt = f"{context}\n\n{prompt}"
+        combined_prompt = _NON_INTERACTIVE_HEADER + f"{context}\n\n{prompt}"
     if prior_files_note:
         combined_prompt += prior_files_note
     combined_prompt = combined_prompt.strip()
@@ -787,17 +808,12 @@ MAX_REVISE_ATTEMPTS = int(os.environ.get("PIPELINE_MAX_REVISE", "1"))
 
 
 def _pm_health_check(pm_cfg: dict) -> bool:
-    """Quick check if the PM backend is reachable. Returns True if healthy."""
-    try:
-        _pm_api_call(
-            "You are a health check.",
-            "Reply with exactly: OK",
-            pm_cfg, _retries=1, _backoff=1.0
-        )
-        return True
-    except Exception as e:
-        log.warning("⚠️ PM health check failed: %s", e)
+    """Quick check if PM backend config looks valid (no API call wasted)."""
+    backend = pm_cfg.get("backend", "github_models")
+    if backend == "github_models" and not GITHUB_TOKEN:
+        log.warning("⚠️ PM health check: no GITHUB_TOKEN set")
         return False
+    return True
 
 
 def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
@@ -808,34 +824,39 @@ def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
     """
     stage_instructions = {
         "plan": (
-            "You are working on the PLAN stage. Analyze the following task and create a detailed "
-            "implementation plan. List the files that need to be changed, what changes to make, "
-            "and the order of operations. Output a concrete, actionable plan — do NOT ask questions.\n\n"
+            "You are working on the PLAN stage of an automated pipeline. "
+            "Analyze the codebase and the task below. Read relevant files to understand "
+            "the current implementation. Create a detailed implementation plan that lists:\n"
+            "1. Which files need to be changed\n"
+            "2. What specific changes to make in each file\n"
+            "3. The order of operations\n"
+            "Output a concrete, actionable plan.\n\n"
         ),
         "code": (
-            "You are working on the CODE stage. Implement the changes described below. "
-            "Read the relevant files, make the necessary code changes, and save them. "
-            "Do NOT ask clarifying questions — use your best judgment and implement the solution.\n\n"
+            "You are working on the CODE stage of an automated pipeline. "
+            "Implement the changes described below. Read the relevant files in the codebase, "
+            "understand the current implementation, make the necessary code changes, "
+            "and save them. Use your best judgment to implement a complete solution.\n\n"
         ),
         "test": (
-            "You are working on the TEST stage. Review the recent changes made to the codebase "
-            "(check git diff) and verify they work correctly. Run any existing tests. "
+            "You are working on the TEST stage of an automated pipeline. "
+            "Check git diff to see what changes were made. Verify the changes work correctly "
+            "by reading the modified files. Run any existing tests if applicable. "
             "If there are issues, fix them. Report what you tested and the results.\n\n"
         ),
     }
 
     instruction = stage_instructions.get(stage, f"You are working on the '{stage}' stage. ")
-    prompt = instruction + f"Task:\n{original_prompt}\n"
+    parts = [instruction, f"Task:\n{original_prompt}\n"]
 
     if context:
-        # Include context but clean up any confusing headers
-        clean = context.replace("## PLAN HANDOFF\n## claude\n", "## Previous Stage Output\n")
-        clean = clean.replace("## CODE HANDOFF\n## claude\n", "## Previous Stage Output\n")
-        clean = clean.replace("## TEST HANDOFF\n## claude\n", "## Previous Stage Output\n")
-        prompt += f"\nContext from prior stages:\n{clean[-4000:]}\n"
+        # Clean up any old-format headers that might confuse agents
+        clean = re.sub(r'## [A-Z]+ HANDOFF\n(?:## \w+\n)?', '', context)
+        clean = clean.strip()
+        if clean:
+            parts.append(f"\nContext from prior stages:\n{clean[-4000:]}\n")
 
-    prompt += "\nIMPORTANT: Do NOT ask clarifying questions. Execute the task directly."
-    return prompt
+    return "\n".join(parts)
 
 
 def _save_stage_output(task_id: str, stage: str, content: str,
@@ -894,16 +915,17 @@ def run_pipeline(prompt: str, task_id: str | None = None,
     pipeline_start = time.time()
     original_prompt = prompt
     tid = task_id or f"pipeline-{int(time.time())}"
+    pm_consecutive_failures = 0   # track PM failures to switch to direct mode
 
     STAGE_ORDER = ["rewrite", "plan", "code", "test", "review"]
     skip = bool(start_stage)
 
-    # ── PM health check — decide if we run with PM or in direct mode ─────
+    # ── PM health check — lightweight config check (no API call wasted) ──
     pm_available = _pm_health_check(pm_cfg)
     if not pm_available:
         log.warning("⚠️ PM backend unavailable — running pipeline in DIRECT mode (no PM oversight)")
     else:
-        log.info("✅ PM backend healthy")
+        log.info("✅ PM backend config OK — will switch to DIRECT mode if API fails")
 
     log.info("🚀 Pipeline starting for: %s (start_stage=%s, pm=%s)",
              tid, start_stage or "rewrite", "yes" if pm_available else "DIRECT")
@@ -938,8 +960,15 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 
         # ── Rewrite: PM-only, no CLI team ───────────────────────────────────
         if stage == "rewrite":
-            if pm_available:
+            if pm_available and pm_consecutive_failures < 2:
+                old_prompt = prompt
                 prompt = rewrite_prompt(original_prompt, pm_cfg)
+                if prompt == original_prompt:
+                    # rewrite_prompt returns original on failure — count as PM failure
+                    pm_consecutive_failures += 1
+                    log.warning("   PM rewrite failed (%d consecutive)", pm_consecutive_failures)
+                else:
+                    pm_consecutive_failures = 0
             else:
                 log.info("   [DIRECT] Skipping PM rewrite — using original prompt")
             stage_results["rewrite"] = prompt
@@ -963,7 +992,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             stage_results["review"] = pm_result["full_response"]
             _save_stage_output(tid, "review", pm_result["full_response"],
                                notes=f"Verdict: {pm_result['verdict']}")
-            context += f"\n\n## REVIEW HANDOFF\n{pm_result['handoff']}"
+            context += f"\n\n=== Review stage output ===\n{pm_result['handoff']}\n=== End review ==="
             context = _cap_context(context)
 
             if pm_result["issues"]:
@@ -993,7 +1022,10 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             continue
 
         # ── Plan / Code / Test ─────────────────────────────────────────────
-        if not pm_available:
+        # Use direct mode if PM is unavailable or has failed consecutively
+        use_direct = not pm_available or pm_consecutive_failures >= 2
+
+        if use_direct:
             # ── DIRECT mode: no PM, send actionable prompts straight to CLI ──
             direct_prompt = _build_direct_prompt(stage, prompt, context)
             log.info("   [DIRECT] Built prompt for '%s' (%d chars)", stage, len(direct_prompt))
@@ -1010,7 +1042,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 stage_results[stage] = combined
                 _save_stage_output(tid, stage, combined,
                                    notes="Direct mode — no PM oversight.")
-                context += f"\n\n{stage.upper()} output:\n{combined[-3000:]}"
+                context += f"\n\n=== {stage.capitalize()} stage output ===\n{combined[-3000:]}\n=== End {stage} ==="
                 context = _cap_context(context)
 
             elapsed = time.time() - _stage_start
@@ -1024,9 +1056,17 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 
         # ── Full PM mode: PM directs → team runs → PM oversees ───────────
         for attempt in range(1 + MAX_REVISE_ATTEMPTS):
-            directed_prompt = pm_direct_team(stage, prompt, context, team, pm_cfg)
-            team_outputs = run_team(stage, directed_prompt, team, context, timeout,
-                                    task_id=tid)
+            directed_prompt, pm_ok = pm_direct_team(stage, prompt, context, team, pm_cfg)
+            if not pm_ok:
+                pm_consecutive_failures += 1
+                log.warning("   PM failed (%d consecutive) — prompt is direct-mode fallback",
+                            pm_consecutive_failures)
+            else:
+                pm_consecutive_failures = 0
+
+            # Don't pass raw context separately — it's already in the directed prompt
+            team_outputs = run_team(stage, directed_prompt, team, "",
+                                    timeout, task_id=tid)
 
             if not team_outputs:
                 log.warning("⚠️ Stage '%s' — no team output, continuing", stage)
@@ -1048,7 +1088,6 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                         team_outputs, cross_reviews, pm_cfg
                     )
                 else:
-                    # Cross-review failed, fall back to standard oversight
                     pm_result = pm_oversee_stage(
                         stage, original_prompt, context, team_outputs, pm_cfg
                     )
@@ -1057,6 +1096,13 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 pm_result = pm_oversee_stage(
                     stage, original_prompt, context, team_outputs, pm_cfg
                 )
+
+            # Track PM API success
+            if not pm_result.get("pm_succeeded", True):
+                pm_consecutive_failures += 1
+                log.warning("   PM oversight failed (%d consecutive)", pm_consecutive_failures)
+            else:
+                pm_consecutive_failures = 0
 
             # ── PM quality gate ─────────────────────────────────────────────
             verdict = pm_result["verdict"]
@@ -1069,9 +1115,6 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             if verdict == "revise" and attempt < MAX_REVISE_ATTEMPTS:
                 log.warning("   🔄 PM verdict: REVISE (attempt %d/%d) — re-running stage '%s'",
                             attempt + 1, MAX_REVISE_ATTEMPTS, stage)
-                # Inject PM feedback into context in a CLI-friendly format
-                # (avoid ## headers that confuse CLI agents into thinking
-                # they received a revision request instead of a task)
                 issues_text = "\n".join(f"- {iss}" for iss in issues)
                 context += (
                     f"\n\nThe previous {stage} attempt was rejected. "
@@ -1088,7 +1131,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             stage_results[stage] = pm_result["full_response"]
             _save_stage_output(tid, stage, pm_result["full_response"],
                                notes=f"Verdict: {verdict} | Issues: {len(issues)}")
-            context += f"\n\n## {stage.upper()} HANDOFF\n{pm_result['handoff']}"
+            context += f"\n\n=== {stage.capitalize()} stage output ===\n{pm_result['handoff']}\n=== End {stage} ==="
             context = _cap_context(context)
             elapsed = time.time() - _stage_start
             log.info("   ✅ Stage '%s' done in %.0fs — PM: %s", stage, elapsed, verdict.upper())
