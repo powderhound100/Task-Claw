@@ -149,8 +149,9 @@ def build_cli_command(provider: dict, phase: str, prompt: str) -> list[str]:
     return [binary] + sub + args
 
 
-def get_timeout(provider: dict, phase: str) -> int:
-    """Get timeout for a phase, checking env overrides then provider config."""
+def get_timeout(provider: dict, phase: str) -> int | None:
+    """Get timeout for a phase, checking env overrides then provider config.
+    Returns None (no timeout) when the resolved value is 0."""
     env_map = {
         "plan":      ("PIPELINE_PLAN_TIMEOUT",    "COPILOT_PLAN_TIMEOUT"),
         "implement": ("PIPELINE_CODE_TIMEOUT",    "COPILOT_TIMEOUT"),
@@ -161,7 +162,8 @@ def get_timeout(provider: dict, phase: str) -> int:
     for env_key in env_map.get(phase, ("COPILOT_TIMEOUT",)):
         env_val = os.environ.get(env_key)
         if env_val:
-            return int(env_val)
+            v = int(env_val)
+            return None if v == 0 else v
 
     timeout_key = {
         "plan":      "plan_timeout",
@@ -171,7 +173,8 @@ def get_timeout(provider: dict, phase: str) -> int:
         "review":    "review_timeout",
     }.get(phase, "implement_timeout")
 
-    return int(provider.get(timeout_key, 600))
+    v = int(provider.get(timeout_key, 600))
+    return None if v == 0 else v
 
 
 def list_available_providers() -> dict[str, str]:
@@ -254,8 +257,9 @@ def run_cli_command(provider: dict, phase: str, prompt: str,
     if not Path(work_dir).is_dir():
         log.warning("   cwd '%s' does not exist — falling back to %s", work_dir, AGENT_DIR)
         work_dir = str(AGENT_DIR)
-    log.info("   CLI [%s/%s]: %s ... (timeout=%ds)",
-             provider.get("name", "?"), phase, " ".join(cmd[:3]), timeout)
+    timeout_label = f"{timeout}s" if timeout else "no timeout"
+    log.info("   CLI [%s/%s]: %s ... (%s)",
+             provider.get("name", "?"), phase, " ".join(cmd[:3]), timeout_label)
     try:
         result = subprocess.run(
             cmd, cwd=work_dir,
@@ -270,8 +274,8 @@ def run_cli_command(provider: dict, phase: str, prompt: str,
         output = result.stdout.strip() if result.stdout else result.stderr.strip()
         return result.returncode == 0, output
     except subprocess.TimeoutExpired:
-        log.error("   Timed out after %ds", timeout)
-        return False, f"Timed out after {timeout}s"
+        log.error("   Timed out after %s", timeout_label)
+        return False, f"Timed out after {timeout_label}"
     except Exception as e:
         log.error("   CLI error: %s", e)
         return False, str(e)
@@ -542,7 +546,7 @@ def cross_review_code(team_outputs: list, plan_context: str,
             ex.submit(_review_other, i): team_outputs[i][0]
             for i in range(len(team_outputs))
         }
-        for fut in concurrent.futures.as_completed(futures, timeout=timeout + 30):
+        for fut in concurrent.futures.as_completed(futures, timeout=None if timeout is None else timeout + 30):
             try:
                 res = fut.result()
                 if res:
@@ -648,7 +652,7 @@ def run_team(stage_name: str, prompt: str, team_provider_names: list,
         max_workers=max(1, len(team_provider_names))
     ) as ex:
         futures = {ex.submit(_run_one, name): name for name in team_provider_names}
-        for fut in concurrent.futures.as_completed(futures, timeout=timeout + 30):
+        for fut in concurrent.futures.as_completed(futures, timeout=None if timeout is None else timeout + 30):
             try:
                 res = fut.result()
                 if res:
