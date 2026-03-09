@@ -6,7 +6,7 @@ and pushes to production.
 
 Supported CLI providers are defined in providers.json.
 """
-AGENT_VERSION = "2026.03.09-v4"  # bump this to verify we're running the right code
+AGENT_VERSION = "2026.03.09-v5"  # bump this to verify we're running the right code
 
 import json
 import os
@@ -274,8 +274,12 @@ def run_cli_command(provider: dict, phase: str, prompt: str,
         log.warning("   cwd '%s' does not exist — falling back to %s", work_dir, AGENT_DIR)
         work_dir = str(AGENT_DIR)
     timeout_label = f"{timeout}s" if timeout else "no timeout"
-    log.info("   CLI [%s/%s]: %s ... (%s)",
-             provider.get("name", "?"), phase, " ".join(cmd[:3]), timeout_label)
+    # Log full command (with prompt truncated to 100 chars)
+    cmd_display = []
+    for c in cmd:
+        cmd_display.append(c[:100] + "…" if len(c) > 100 else c)
+    log.info("   CLI [%s/%s]: %s (%s)",
+             provider.get("name", "?"), phase, " ".join(cmd_display), timeout_label)
     try:
         result = subprocess.run(
             cmd, cwd=work_dir,
@@ -404,6 +408,36 @@ def pm_direct_team(stage_name: str, original_prompt: str, context: str,
         return _build_direct_prompt(stage_name, original_prompt, context), False
 
 
+_GARBAGE_PATTERNS = [
+    "what would you like", "could you share", "could you describe",
+    "could you provide", "could you grant", "could you tell",
+    "could you give", "could you let", "could you help",
+    "could you approve", "could you confirm", "could you try",
+    "please describe", "please provide", "please share",
+    "please approve", "i don't see", "i don't have",
+    "what bug are you", "message might be incomplete",
+    "message got cut off", "plan handoff", "no plan content",
+    "what do you want", "how can i help", "can you clarify",
+    "more information", "more details", "what specific",
+    "what exactly", "can you tell me", "need more context",
+    "i'd be happy to help", "i'll need to know",
+    "permission was denied", "permission denied",
+    "grant permission", "i need access", "need write permission",
+    "need permission", "approve the edit", "can you confirm",
+    "i need write", "write permission",
+]
+
+
+def _is_garbage_output(team_outputs: list) -> bool:
+    """Check if team output is garbage (questions, too short, permission asks, etc.)."""
+    total_len = sum(len(out) for _, out in team_outputs)
+    all_output = " ".join(out.lower() for _, out in team_outputs)
+    return (
+        total_len < 300
+        or any(pat in all_output for pat in _GARBAGE_PATTERNS)
+    )
+
+
 def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
                      team_outputs: list, pm_cfg: dict) -> dict:
     """
@@ -452,31 +486,7 @@ def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
              stage_name, len(team_outputs))
     # ── First: check team output for obvious garbage BEFORE calling PM ─────
     total_output_len = sum(len(out) for _, out in team_outputs)
-    all_output = " ".join(out.lower() for _, out in team_outputs)
-    garbage_patterns = [
-        "what would you like",
-        "could you share",
-        "could you describe",
-        "could you provide",
-        "please describe",
-        "please provide",
-        "i don't see",
-        "i don't have",
-        "what bug are you",
-        "message might be incomplete",
-        "message got cut off",
-        "plan handoff",
-        "no plan content",
-        "what do you want",
-        "how can i help",
-        "can you clarify",
-        "more information",
-        "more details",
-    ]
-    looks_garbage = (
-        total_output_len < 200
-        or any(pat in all_output for pat in garbage_patterns)
-    )
+    looks_garbage = _is_garbage_output(team_outputs)
 
     if looks_garbage:
         log.warning("   ❌ Team output is garbage (%d chars, matches patterns) — REVISE",
@@ -691,11 +701,7 @@ def pm_merge_with_reviews(stage_name: str, original_prompt: str, context: str,
         )
 
 
-_NON_INTERACTIVE_FOOTER = (
-    "\n\nIMPORTANT: This is an automated pipeline. "
-    "Do NOT ask clarifying questions or say you need more info. "
-    "Produce actionable output immediately."
-)
+_NON_INTERACTIVE_FOOTER = ""  # Removed: was causing Claude to prompt for permissions instead of acting
 
 
 def run_team(stage_name: str, prompt: str, team_provider_names: list,
@@ -718,24 +724,10 @@ def run_team(stage_name: str, prompt: str, team_provider_names: list,
     }
     phase = phase_map.get(stage_name, "implement")
 
-    # Build the prompt: include references to prior stage output files
-    prior_files_note = ""
-    if task_id:
-        task_dir = PIPELINE_OUTPUT_DIR / task_id
-        if task_dir.exists():
-            saved = sorted(task_dir.glob("*.md"))
-            saved = [f for f in saved if not f.name.startswith(".")]
-            if saved:
-                prior_files_note = (
-                    "\n\n## Prior stage outputs (saved on disk — read these files for full context)\n"
-                    + "\n".join(f"- {f}" for f in saved)
-                )
-
-    combined_prompt = prompt + _NON_INTERACTIVE_FOOTER
+    # Keep prompt clean and short — verbose prompts confuse Claude Code
+    combined_prompt = prompt
     if context:
-        combined_prompt = f"{prompt}\n\n{context}" + _NON_INTERACTIVE_FOOTER
-    if prior_files_note:
-        combined_prompt += prior_files_note
+        combined_prompt = f"{prompt}\n\n{context}"
     combined_prompt = combined_prompt.strip()
 
     # Write prompt to file so CLI can read it instead of relying on cmd-line arg
@@ -816,42 +808,33 @@ def _pm_health_check(pm_cfg: dict) -> bool:
 
 def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
     """
-    Build a self-contained, actionable prompt for a CLI agent when the PM is unavailable.
-    Task goes FIRST so Claude engages with it immediately.
+    Build a clean prompt for a CLI agent. Keep it SHORT — verbose meta-instructions
+    cause Claude Code to get confused about permissions and ask questions instead of acting.
     """
-    stage_instructions = {
-        "plan": (
-            "Search the codebase for files related to this task. "
-            "Read those files. Then create a detailed implementation plan listing:\n"
-            "1. Which files need to be changed\n"
-            "2. What specific changes to make in each file\n"
-            "3. The order of operations\n"
-        ),
-        "code": (
-            "Read the relevant files in the codebase. "
-            "Make the necessary code changes and save them. "
-            "Implement a complete solution.\n"
-        ),
-        "test": (
-            "Run git diff to see what changes were made. "
-            "Read the modified files and verify the changes work. "
-            "Run any existing tests. Fix any issues you find. "
-            "Report what you tested and the results.\n"
-        ),
-    }
+    # For plan stage, just ask for a plan (output-only, no edits)
+    if stage == "plan":
+        return f"{original_prompt}\n\nOutput an implementation plan — do not edit any files."
 
-    instruction = stage_instructions.get(stage, f"Complete the '{stage}' stage. ")
+    # For code stage, just give the task (Claude knows how to code)
+    if stage == "code":
+        prompt = original_prompt
+        # Include plan context if available (only non-garbage parts)
+        if context:
+            clean = re.sub(r'## [A-Z]+ HANDOFF\n(?:## \w+\n)?', '', context)
+            # Strip out any prior garbage like permission messages
+            lines = [l for l in clean.strip().split('\n')
+                     if not any(p in l.lower() for p in _GARBAGE_PATTERNS)]
+            clean = '\n'.join(lines).strip()
+            if clean and len(clean) > 50:
+                prompt += f"\n\nPlan:\n{clean[-3000:]}"
+        return prompt
 
-    # Task FIRST, then instructions
-    parts = [f"Task: {original_prompt}\n", instruction]
+    # For test stage, check the diff
+    if stage == "test":
+        return f"Run git diff to see recent changes, then verify they work correctly. Report results.\n\nOriginal task: {original_prompt}"
 
-    if context:
-        clean = re.sub(r'## [A-Z]+ HANDOFF\n(?:## \w+\n)?', '', context)
-        clean = clean.strip()
-        if clean:
-            parts.append(f"\nPrior stage output:\n{clean[-4000:]}\n")
-
-    return "\n".join(parts)
+    # Fallback
+    return original_prompt
 
 
 def _test_found_failures(test_output: str) -> bool:
@@ -1044,7 +1027,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 
         # ── Plan / Code / Test ─────────────────────────────────────────────
         # Use direct mode if PM is unavailable or has failed consecutively
-        use_direct = not pm_available or pm_consecutive_failures >= 2
+        use_direct = not pm_available or pm_consecutive_failures >= 1
 
         if use_direct:
             # ── DIRECT mode: no PM, send actionable prompts straight to CLI ──
@@ -1056,6 +1039,22 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             if not team_outputs:
                 log.warning("⚠️ Stage '%s' — no team output, continuing", stage)
                 stage_results[stage] = ""
+            elif _is_garbage_output(team_outputs):
+                # ── Garbage detected in direct mode — retry with clean prompt (no context) ──
+                log.warning("   ❌ [DIRECT] Garbage output from '%s' — retrying with clean prompt", stage)
+                clean_prompt = _build_direct_prompt(stage, prompt, "")  # no context = no garbage
+                retry_outputs = run_team(stage, clean_prompt, team, "", timeout, task_id=tid)
+                if retry_outputs and not _is_garbage_output(retry_outputs):
+                    if stage == "code":
+                        _restart_changed_services()
+                    combined = "\n\n".join(out for _, out in retry_outputs)
+                    stage_results[stage] = combined
+                    _save_stage_output(tid, stage, combined, notes="Direct mode — retry after garbage.")
+                    context += f"\n\n=== {stage.capitalize()} stage output ===\n{combined[-3000:]}\n=== End {stage} ==="
+                    context = _cap_context(context)
+                else:
+                    log.warning("   ❌ [DIRECT] Retry also garbage for '%s' — skipping", stage)
+                    stage_results[stage] = ""
             else:
                 if stage == "code":
                     _restart_changed_services()
