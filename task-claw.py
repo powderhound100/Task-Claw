@@ -432,9 +432,12 @@ def _is_garbage_output(team_outputs: list) -> bool:
     """Check if team output is garbage (questions, too short, permission asks, etc.)."""
     total_len = sum(len(out) for _, out in team_outputs)
     all_output = " ".join(out.lower() for _, out in team_outputs)
+    # Only flag as garbage if output is very short AND matches a garbage pattern
+    # Short but real output (e.g. "Done. Added X. Committed.") should pass
+    has_garbage_pattern = any(pat in all_output for pat in _GARBAGE_PATTERNS)
     return (
-        total_len < 300
-        or any(pat in all_output for pat in _GARBAGE_PATTERNS)
+        (total_len < 100)  # very short = always garbage
+        or has_garbage_pattern  # matches known garbage pattern
     )
 
 
@@ -2057,7 +2060,8 @@ def process_task(task: dict, tasks: list, state: dict):
     notify_ha(f"🤖 Agent grabbed task: {title}",
               f"Processing {task_type} (priority: {priority}).\nTask ID: {task_id}")
 
-    prompt = f"Task Type: {task_type}\nTitle: {title}\nPriority: {priority}\nDescription: {desc}"
+    # Description first — Claude works best when the task is front and center
+    prompt = f"{title}: {desc}" if desc and desc != title else title
     photos = task.get("photos", [])
     if photos:
         prompt += f"\n\nAttached Photos ({len(photos)}): {', '.join(photos)}"
