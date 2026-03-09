@@ -6,7 +6,7 @@ and pushes to production.
 
 Supported CLI providers are defined in providers.json.
 """
-AGENT_VERSION = "2026.03.08-v3"  # bump this to verify we're running the right code
+AGENT_VERSION = "2026.03.09-v4"  # bump this to verify we're running the right code
 
 import json
 import os
@@ -927,6 +927,16 @@ def run_pipeline(prompt: str, task_id: str | None = None,
     original_prompt = prompt
     tid = task_id or f"pipeline-{int(time.time())}"
     pm_consecutive_failures = 0   # track PM failures to switch to direct mode
+
+    # ── Canary: write a marker file to prove this code ran ──────────────
+    canary = AGENT_DIR / "_pipeline_canary.txt"
+    canary.write_text(f"Pipeline code version: {AGENT_VERSION}\n"
+                      f"Time: {datetime.now().isoformat()}\n"
+                      f"Has garbage_detect: True\n"
+                      f"Has direct_mode: True\n"
+                      f"Has _NON_INTERACTIVE_FOOTER: True\n",
+                      encoding="utf-8")
+    log.info("CANARY: Pipeline code %s loaded (canary written to %s)", AGENT_VERSION, canary)
 
     STAGE_ORDER = ["rewrite", "plan", "code", "test", "review"]
     skip = bool(start_stage)
