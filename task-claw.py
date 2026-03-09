@@ -814,9 +814,14 @@ def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
     Build a clean prompt for a CLI agent. Keep it SHORT — verbose meta-instructions
     cause Claude Code to get confused about permissions and ask questions instead of acting.
     """
-    # For plan stage, just ask for a plan (output-only, no edits)
+    # For plan stage — analyze codebase, output a plan.
+    # Claude tries to edit if the prompt contains action words, so we rephrase
+    # the task as an analysis question. permission-mode=plan blocks writes as safety net.
     if stage == "plan":
-        return f"{original_prompt}\n\nOutput an implementation plan — do not edit any files."
+        return (f"I need to understand the codebase before making changes.\n\n"
+                f"Task context: {original_prompt}\n\n"
+                "Which files are involved? What does each relevant file do? "
+                "What is the step-by-step plan to accomplish this task?")
 
     # For code stage, just give the task (Claude knows how to code)
     if stage == "code":
