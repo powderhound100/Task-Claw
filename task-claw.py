@@ -6,6 +6,7 @@ and pushes to production.
 
 Supported CLI providers are defined in providers.json.
 """
+AGENT_VERSION = "2026.03.08-v3"  # bump this to verify we're running the right code
 
 import json
 import os
@@ -2149,7 +2150,7 @@ def main():
                  result["success"], result["published"], result.get("error"))
         sys.exit(0 if result["success"] else 1)
 
-    log.info("🦀 Task-Claw Agent starting…")
+    log.info("🦀 Task-Claw Agent starting… (version %s)", AGENT_VERSION)
     log.info("   Project dir:  %s", PROJECT_DIR)
     log.info("   Tasks file:   %s", TASKS_FILE)
     log.info("   Ideas file:   %s", IDEAS_FILE)

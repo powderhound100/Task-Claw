@@ -30,6 +30,8 @@ for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0.env") do (
 )
 
 cd /d "%~dp0"
+:: Disable bytecode caching to always use latest source
+set PYTHONDONTWRITEBYTECODE=1
 echo Starting Task-Claw agent (port 8099)...
 echo.
 python task-claw.py
