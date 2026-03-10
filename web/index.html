@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Task-Claw</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="stylesheet" href="/css/tasks.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>Task-Claw</h1>
+            <nav>
+                <a href="/" class="tab active" id="tabTasks">Tasks</a>
+                <a href="#" class="tab" id="tabIdeas">Ideas</a>
+                <a href="/pipeline.html">Pipeline</a>
+            </nav>
+            <button class="btn btn-primary btn-sm" id="btnNewTask" onclick="openTaskForm()">+ New Task</button>
+        </header>
+
+        <!-- Task Filters -->
+        <div id="taskFilters" class="task-filters"></div>
+
+        <!-- Task List -->
+        <div id="taskList" class="task-list"></div>
+
+        <!-- Ideas (hidden by default) -->
+        <div id="ideaSection" style="display:none">
+            <div id="ideaFilters" class="task-filters"></div>
+            <div id="ideaList" class="task-list"></div>
+        </div>
+
+        <!-- Pipeline Overview Strip (shows when a task is in-progress) -->
+        <div id="pipelineOverview" class="pipeline-overview" style="display:none"></div>
+    </div>
+
+    <!-- Task Form Modal -->
+    <div id="taskFormOverlay" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeTaskForm()">
+        <div class="modal task-form">
+            <div class="modal-header">
+                <h2 id="formTitle">New Task</h2>
+                <button class="btn btn-icon modal-close" onclick="closeTaskForm()">&times;</button>
+            </div>
+            <form id="taskForm" onsubmit="submitTask(event)">
+                <div class="form-group">
+                    <label for="taskTitle">Title</label>
+                    <input type="text" id="taskTitle" required placeholder="What needs to be done?">
+                </div>
+                <div class="form-group">
+                    <label for="taskType">Type</label>
+                    <select id="taskType">
+                        <option value="task">Task</option>
+                        <option value="bug">Bug</option>
+                        <option value="feature">Feature</option>
+                        <option value="improvement">Improvement</option>
+                    </select>
+                </div>
+                <div class="grid-2">
+                    <div class="form-group">
+                        <label for="taskPriority">Priority</label>
+                        <select id="taskPriority">
+                            <option value="low">Low</option>
+                            <option value="medium" selected>Medium</option>
+                            <option value="high">High</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="taskProvider">Provider</label>
+                        <select id="taskProvider">
+                            <option value="">Default</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="taskDesc">Description</label>
+                    <textarea id="taskDesc" rows="4" placeholder="Describe the task..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Photos</label>
+                    <div id="photoUpload" class="photo-upload" onclick="document.getElementById('photoInput').click()" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="handlePhotoDrop(event)">
+                        Drop photos here or click to upload
+                    </div>
+                    <input type="file" id="photoInput" multiple accept="image/*" style="display:none" onchange="handlePhotoSelect(event)">
+                    <div id="photoPreviews" class="photo-previews"></div>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="taskAutoImplement" checked> Auto-implement
+                    </label>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeTaskForm()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Task Detail Modal -->
+    <div id="taskDetailOverlay" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeTaskDetail()">
+        <div class="modal" id="taskDetailModal">
+            <!-- populated by JS -->
+        </div>
+    </div>
+
+    <!-- Lightbox -->
+    <div id="lightbox" class="lightbox" style="display:none" onclick="closeLightbox()">
+        <img id="lightboxImg" src="" alt="">
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar" id="statusBar">
+        <div class="agent-status" id="agentStatus">Agent: --</div>
+        <div class="status-right">
+            <span id="apiCounter">API: --</span>
+            <button class="btn btn-sm btn-primary agent-trigger-btn" onclick="triggerAgent()">Trigger</button>
+        </div>
+    </div>
+
+    <script src="/js/app.js"></script>
+    <script src="/js/tasks.js"></script>
+</body>
+</html>

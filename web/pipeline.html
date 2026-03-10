@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Task-Claw - Pipeline</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="stylesheet" href="/css/pipeline.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>Task-Claw Pipeline</h1>
+            <nav>
+                <a href="/">Tasks</a>
+                <a href="/pipeline.html" class="active">Pipeline</a>
+            </nav>
+        </header>
+
+        <!-- Agent Status -->
+        <section class="pipeline-section">
+            <h2>Agent Status</h2>
+            <div class="card" id="agentInfo">
+                <div class="grid-3">
+                    <div><strong>State:</strong> <span id="pAgentState">--</span></div>
+                    <div><strong>Current Task:</strong> <span id="pCurrentTask">--</span></div>
+                    <div><strong>API Calls:</strong> <span id="pApiCalls">--</span></div>
+                </div>
+                <div class="grid-3 mt-8">
+                    <div><strong>Last Run:</strong> <span id="pLastRun">--</span></div>
+                    <div><strong>Last Trigger:</strong> <span id="pLastTrigger">--</span></div>
+                    <div><strong>Stage:</strong> <span id="pCurrentStage">--</span></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Live Pipeline Monitor -->
+        <section class="pipeline-section">
+            <h2>Pipeline Monitor</h2>
+            <div class="card pipeline-monitor" id="pipelineMonitor">
+                <div class="stage-flow" id="stageFlow">
+                    <!-- populated by JS -->
+                </div>
+                <div id="monitorDetails" class="mt-16"></div>
+            </div>
+        </section>
+
+        <!-- Per-Stage Stats -->
+        <section class="pipeline-section">
+            <h2>Stage Stats</h2>
+            <div id="stageStats" class="stats-dashboard">
+                <div class="empty-state">No pipeline data yet</div>
+            </div>
+        </section>
+
+        <!-- Pipeline History -->
+        <section class="pipeline-section">
+            <h2>Pipeline History</h2>
+            <div id="pipelineHistory">
+                <div class="empty-state">No completed runs</div>
+            </div>
+        </section>
+
+        <!-- Pipeline Configuration -->
+        <section class="pipeline-section">
+            <h2>Configuration</h2>
+            <div class="card config-section">
+                <h3>Pipeline Stages</h3>
+                <div id="pipelineStagesConfig" class="mt-8"></div>
+            </div>
+            <div class="card config-section mt-16">
+                <h3>Providers</h3>
+                <div id="providerList" class="provider-list mt-8"></div>
+            </div>
+        </section>
+
+        <!-- Config Editor -->
+        <section class="pipeline-section">
+            <h2>Config Editor</h2>
+            <div class="card config-editor">
+                <div class="tabs">
+                    <div class="tab active" onclick="showConfigTab('pipeline')">pipeline.json</div>
+                    <div class="tab" onclick="showConfigTab('providers')">providers.json</div>
+                </div>
+                <textarea id="configEditor" spellcheck="false"></textarea>
+                <div class="form-actions mt-8">
+                    <button class="btn btn-primary" onclick="saveConfig()">Save</button>
+                    <button class="btn btn-secondary" onclick="loadCurrentConfig()">Reset</button>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="/js/app.js"></script>
+    <script src="/js/pipeline.js"></script>
+</body>
+</html>
