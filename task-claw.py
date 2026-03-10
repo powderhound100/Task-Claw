@@ -1081,12 +1081,14 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                                           str(stages_cfg.get("code", {}).get("timeout", 300))))
                     code_timeout = None if code_timeout_val == 0 else code_timeout_val
                     fix_prompt = (
-                        f"Task: {prompt}\n\n"
-                        f"The test stage found these failures. Fix them:\n{combined[-3000:]}\n"
-                        "Read the failing files, fix the issues, and save your changes."
+                        f"{prompt}\n\n"
+                        f"Test failures to fix:\n{combined[-3000:]}"
                     )
                     fix_outputs = run_team("code", fix_prompt, code_team, "",
                                           code_timeout, task_id=tid)
+                    if fix_outputs and _is_garbage_output(fix_outputs):
+                        log.warning("   ❌ Code-fix produced garbage (permission request?) — discarding")
+                        fix_outputs = None
                     if fix_outputs:
                         _restart_changed_services()
                         fix_combined = "\n\n".join(out for _, out in fix_outputs)
