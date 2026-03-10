@@ -431,14 +431,10 @@ _GARBAGE_PATTERNS = [
 def _is_garbage_output(team_outputs: list) -> bool:
     """Check if team output is garbage (questions, too short, permission asks, etc.)."""
     total_len = sum(len(out) for _, out in team_outputs)
+    if total_len < 100:  # Trivially short — almost always a permission denial or empty run
+        return True
     all_output = " ".join(out.lower() for _, out in team_outputs)
-    # Only flag as garbage if output is very short AND matches a garbage pattern
-    # Short but real output (e.g. "Done. Added X. Committed.") should pass
-    has_garbage_pattern = any(pat in all_output for pat in _GARBAGE_PATTERNS)
-    return (
-        (total_len < 100)  # very short = always garbage
-        or has_garbage_pattern  # matches known garbage pattern
-    )
+    return any(pat in all_output for pat in _GARBAGE_PATTERNS)
 
 
 def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
