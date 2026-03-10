@@ -112,6 +112,7 @@ def get_provider_for_phase(phase: str, task_override: str | None = None) -> dict
     env_map = {
         "plan":      "CLI_PLAN_PROVIDER",
         "implement": "CLI_IMPLEMENT_PROVIDER",
+        "simplify":  "CLI_IMPLEMENT_PROVIDER",
         "security":  "CLI_SECURITY_PROVIDER",
         "test":      "CLI_TEST_PROVIDER",
         "review":    "CLI_REVIEW_PROVIDER",
@@ -148,14 +149,17 @@ def build_cli_command(provider: dict, phase: str, prompt: str,
     arg_key = {
         "plan":      "plan_args",
         "implement": "implement_args",
+        "simplify":  "simplify_args",
         "security":  "security_args",
         "test":      "test_args",
         "review":    "review_args",
     }.get(phase, "implement_args")
 
-    # Fallback: test/review → plan_args if not defined
+    # Fallback: test/review → plan_args, simplify → implement_args if not defined
     if arg_key not in provider and phase in ("test", "review"):
         arg_key = "plan_args"
+    if arg_key not in provider and phase == "simplify":
+        arg_key = "implement_args"
 
     args = list(provider.get(arg_key, ["-p", "{prompt}"]))
     pf_str = str(prompt_file) if prompt_file else ""
@@ -168,11 +172,12 @@ def get_timeout(provider: dict, phase: str) -> int | None:
     """Get timeout for a phase, checking env overrides then provider config.
     Returns None (no timeout) when the resolved value is 0."""
     env_map = {
-        "plan":      ("PIPELINE_PLAN_TIMEOUT",    "COPILOT_PLAN_TIMEOUT"),
-        "implement": ("PIPELINE_CODE_TIMEOUT",    "COPILOT_TIMEOUT"),
-        "security":  ("PIPELINE_REVIEW_TIMEOUT",  "COPILOT_SECURITY_TIMEOUT"),
-        "test":      ("PIPELINE_TEST_TIMEOUT",    "COPILOT_SECURITY_TIMEOUT"),
-        "review":    ("PIPELINE_REVIEW_TIMEOUT",  "COPILOT_SECURITY_TIMEOUT"),
+        "plan":      ("PIPELINE_PLAN_TIMEOUT",      "COPILOT_PLAN_TIMEOUT"),
+        "implement": ("PIPELINE_CODE_TIMEOUT",      "COPILOT_TIMEOUT"),
+        "simplify":  ("PIPELINE_SIMPLIFY_TIMEOUT",  "COPILOT_TIMEOUT"),
+        "security":  ("PIPELINE_REVIEW_TIMEOUT",    "COPILOT_SECURITY_TIMEOUT"),
+        "test":      ("PIPELINE_TEST_TIMEOUT",      "COPILOT_SECURITY_TIMEOUT"),
+        "review":    ("PIPELINE_REVIEW_TIMEOUT",    "COPILOT_SECURITY_TIMEOUT"),
     }
     for env_key in env_map.get(phase, ("COPILOT_TIMEOUT",)):
         env_val = os.environ.get(env_key)
@@ -715,11 +720,12 @@ def run_team(stage_name: str, prompt: str, team_provider_names: list,
     without cramming everything into the command-line argument.
     """
     phase_map = {
-        "rewrite": "plan",
-        "plan":    "plan",
-        "code":    "implement",
-        "test":    "test",
-        "review":  "review",
+        "rewrite":  "plan",
+        "plan":     "plan",
+        "code":     "implement",
+        "simplify": "simplify",
+        "test":     "test",
+        "review":   "review",
     }
     phase = phase_map.get(stage_name, "implement")
 
@@ -833,6 +839,12 @@ def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
                 prompt += f"\n\nPlan:\n{clean[-3000:]}"
         return prompt
 
+    # For simplify stage, review changed code for reuse, quality, and efficiency
+    if stage == "simplify":
+        return ("Run git diff to see the recent changes. "
+                "Review the changed code for reuse, quality, and efficiency, then fix any issues found.\n\n"
+                f"Original task: {original_prompt}")
+
     # For test stage, check the diff
     if stage == "test":
         return f"Run git diff to see recent changes, then verify they work correctly. Report results.\n\nOriginal task: {original_prompt}"
@@ -889,7 +901,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                  pipeline_cfg: dict | None = None,
                  start_stage: str | None = None) -> dict:
     """
-    Full pipeline: rewrite → plan → code → test → review → publish.
+    Full pipeline: rewrite → plan → code → simplify → test → review → publish.
 
     The Program Manager oversees the entire flow:
     - BEFORE each stage: writes a directed task brief for the team
@@ -925,7 +937,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                       encoding="utf-8")
     log.info("CANARY: Pipeline code %s loaded (canary written to %s)", AGENT_VERSION, canary)
 
-    STAGE_ORDER = ["rewrite", "plan", "code", "test", "review"]
+    STAGE_ORDER = ["rewrite", "plan", "code", "simplify", "test", "review"]
     skip = bool(start_stage)
 
     # ── PM health check — lightweight config check (no API call wasted) ──
@@ -1049,7 +1061,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 clean_prompt = _build_direct_prompt(stage, prompt, "")  # no context = no garbage
                 retry_outputs = run_team(stage, clean_prompt, team, "", timeout, task_id=tid)
                 if retry_outputs and not _is_garbage_output(retry_outputs):
-                    if stage == "code":
+                    if stage in ("code", "simplify"):
                         _restart_changed_services()
                     combined = "\n\n".join(out for _, out in retry_outputs)
                     stage_results[stage] = combined
@@ -1060,7 +1072,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                     log.warning("   ❌ [DIRECT] Retry also garbage for '%s' — skipping", stage)
                     stage_results[stage] = ""
             else:
-                if stage == "code":
+                if stage in ("code", "simplify"):
                     _restart_changed_services()
                 combined = "\n\n".join(out for _, out in team_outputs)
                 stage_results[stage] = combined
@@ -1127,8 +1139,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 stage_results[stage] = ""
                 break
 
-            # After code stage, restart any changed services
-            if stage == "code":
+            # After code/simplify stage, restart any changed services
+            if stage in ("code", "simplify"):
                 _restart_changed_services()
 
             # ── Code stage with 2+ agents: cross-review + deep merge ────────

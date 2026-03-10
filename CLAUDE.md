@@ -28,6 +28,8 @@ User Prompt
     ↓       → PM deep-merge (compares, finds gaps, merges best parts)
     ↓       → quality gate (APPROVE / REVISE)
     ↓                                  ↺ REVISE if needed
+[Simplify]— Review changed code for reuse, quality, efficiency; fix issues
+    ↓
 [Test]    — PM directs → team tests → PM oversees (quality gate)
     ↓                                  ↺ REVISE if needed
 [Review]  — Structured security audit → PM oversees → verdict

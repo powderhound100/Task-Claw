@@ -40,6 +40,7 @@
       "subcommand": [],
       "plan_args": ["-p", "{prompt}", "--permission-mode", "plan", "--dangerously-skip-permissions", "--max-turns", "3"],
       "implement_args": ["-p", "{prompt}", "--dangerously-skip-permissions"],
+      "simplify_args": ["-p", "{prompt}", "--dangerously-skip-permissions"],
       "security_args": ["-p", "{prompt}", "--output-format", "text", "--dangerously-skip-permissions"],
       "test_args": ["-p", "{prompt}", "--dangerously-skip-permissions"],
       "review_args": ["-p", "{prompt}", "--output-format", "text", "--dangerously-skip-permissions"],

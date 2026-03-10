@@ -24,6 +24,12 @@
       "timeout": 600,
       "description": "Implement the plan. WARNING: team size > 1 risks git conflicts."
     },
+    "simplify": {
+      "enabled": true,
+      "team": ["claude"],
+      "timeout": 300,
+      "description": "Review changed code for reuse, quality, and efficiency, then fix issues"
+    },
     "test": {
       "enabled": true,
       "team": ["claude"],
