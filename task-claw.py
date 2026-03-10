@@ -69,6 +69,89 @@ PIPELINE_OUTPUT_DIR = AGENT_DIR / "pipeline-output"
 PIPELINE_OUTPUT_DIR.mkdir(exist_ok=True)
 
 
+# ── Pipeline stats (subagent call tracking) ────────────────────────────────
+_pipeline_stats_lock = threading.Lock()
+_pipeline_stats: dict = {}  # {stage: {"cli_calls": int, "subagents": int, "tool_calls": {}}}
+
+
+def _reset_pipeline_stats():
+    """Reset stats at the start of a pipeline run."""
+    with _pipeline_stats_lock:
+        _pipeline_stats.clear()
+
+
+def _record_cli_call(phase: str, subagent_count: int = 0,
+                     tool_counts: dict | None = None):
+    """Record a CLI invocation and any subagent/tool usage detected in its output."""
+    # Map CLI phase back to pipeline stage name
+    stage = {"plan": "plan", "implement": "code", "simplify": "simplify",
+             "security": "review", "test": "test", "review": "review"}.get(phase, phase)
+    with _pipeline_stats_lock:
+        if stage not in _pipeline_stats:
+            _pipeline_stats[stage] = {"cli_calls": 0, "subagents": 0, "tool_calls": {}}
+        _pipeline_stats[stage]["cli_calls"] += 1
+        _pipeline_stats[stage]["subagents"] += subagent_count
+        if tool_counts:
+            for tool, count in tool_counts.items():
+                _pipeline_stats[stage]["tool_calls"][tool] = (
+                    _pipeline_stats[stage]["tool_calls"].get(tool, 0) + count
+                )
+
+
+def _parse_claude_json_output(raw: str) -> tuple[str, int, dict]:
+    """
+    Parse Claude Code --output-format json output.
+    Returns (text_output, subagent_count, tool_counts_dict).
+    If parsing fails, returns the raw string unchanged with zero counts.
+    """
+    try:
+        messages = json.loads(raw)
+        if not isinstance(messages, list):
+            return raw, 0, {}
+    except (json.JSONDecodeError, TypeError):
+        return raw, 0, {}
+
+    text_parts = []
+    subagent_count = 0
+    tool_counts: dict = {}
+
+    for msg in messages:
+        # Only look at assistant messages
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role") or msg.get("type", "")
+        if role not in ("assistant",):
+            continue
+        content = msg.get("content", [])
+        if isinstance(content, str):
+            text_parts.append(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif block.get("type") == "tool_use":
+                tool_name = block.get("name", "unknown")
+                tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
+                if tool_name == "Agent":
+                    subagent_count += 1
+
+    text_output = "\n".join(text_parts).strip()
+    # If we got no text from parsing, fall back to raw
+    if not text_output:
+        return raw, subagent_count, tool_counts
+    return text_output, subagent_count, tool_counts
+
+
+def _get_pipeline_stats_summary() -> dict:
+    """Return a copy of current pipeline stats."""
+    with _pipeline_stats_lock:
+        return {stage: dict(data) for stage, data in _pipeline_stats.items()}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  CLI PROVIDER SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════
@@ -299,12 +382,24 @@ def run_cli_command(provider: dict, phase: str, prompt: str,
         if result.stderr and result.stderr.strip():
             log.warning("   Stderr: %s", result.stderr.strip()[-500:])
         output = result.stdout.strip() if result.stdout else result.stderr.strip()
+        # Parse Claude JSON output for subagent/tool tracking
+        subagent_count, tool_counts = 0, {}
+        is_claude = provider.get("binary", "") == "claude"
+        if is_claude and output and output.startswith("["):
+            text_output, subagent_count, tool_counts = _parse_claude_json_output(output)
+            if text_output != output:  # successfully parsed JSON
+                output = text_output
+                log.info("   📊 Parsed Claude JSON: %d subagents, tools: %s",
+                         subagent_count, tool_counts)
+        _record_cli_call(phase, subagent_count, tool_counts)
         return result.returncode == 0, output
     except subprocess.TimeoutExpired:
         log.error("   Timed out after %s", timeout_label)
+        _record_cli_call(phase)
         return False, f"Timed out after {timeout_label}"
     except Exception as e:
         log.error("   CLI error: %s", e)
+        _record_cli_call(phase)
         return False, str(e)
 
 
@@ -923,6 +1018,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
     stage_results: dict = {}
     stage_log: list = []          # summary entry per stage
     pipeline_start = time.time()
+    _reset_pipeline_stats()
     original_prompt = prompt
     tid = task_id or f"pipeline-{int(time.time())}"
     pm_consecutive_failures = 0   # track PM failures to switch to direct mode
@@ -1218,10 +1314,21 @@ def run_pipeline(prompt: str, task_id: str | None = None,
     with status_lock:
         agent_status["state"] = "idle"
 
+    # ── Pipeline stats summary ──────────────────────────────────────────────
+    stats = _get_pipeline_stats_summary()
+    total_cli = sum(s.get("cli_calls", 0) for s in stats.values())
+    total_sub = sum(s.get("subagents", 0) for s in stats.values())
+    log.info("📊 Pipeline stats: %d CLI calls, %d subagents spawned", total_cli, total_sub)
+    for stage_name, sdata in stats.items():
+        tools_str = ", ".join(f"{t}={c}" for t, c in sorted(sdata.get("tool_calls", {}).items()))
+        log.info("   %-10s: %d CLI calls, %d subagents%s",
+                 stage_name, sdata["cli_calls"], sdata["subagents"],
+                 f" | tools: {tools_str}" if tools_str else "")
+
     log.info("✅ Pipeline complete for: %s (published=%s)", tid, published)
     return {"success": True, "stage_results": stage_results, "stage_log": stage_log,
             "pipeline_elapsed": round(time.time() - pipeline_start, 1),
-            "published": published, "error": None}
+            "published": published, "error": None, "stats": stats}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
