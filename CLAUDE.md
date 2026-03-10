@@ -53,7 +53,12 @@ If the PM returns REVISE, the stage is re-run with feedback (up to `PIPELINE_MAX
 
 **Threading model:** HTTP trigger server runs in a daemon thread. Research jobs each spawn their own daemon thread. Team members within a pipeline stage run in `ThreadPoolExecutor`. The main loop uses `threading.Event` for interruptible sleep. Shared state is guarded by `status_lock` and `research_lock`.
 
+**Web UI:** Self-contained web interface served from `web/` directory at `http://localhost:8099/`. Tasks page (`/`) for task/idea CRUD with photos, filters, agent status. Pipeline page (`/pipeline.html`) for live monitoring, history, config editing.
+
+**Data storage:** `data/` directory (auto-created, gitignored) contains `tasks.json`, `ideas.json`, and `photos/`. No external dependencies (Node-RED removed).
+
 **State files (auto-generated, not committed):**
+- `data/` — tasks.json, ideas.json, photos/ (self-contained storage)
 - `agent-state.json` — runtime state (daily API call count, task status cache)
 - `agent.log` — rolling log
 - `security-reviews/` — per-task security audit reports
@@ -79,8 +84,8 @@ Key env vars:
 | Variable | Default | Purpose |
 |---|---|---|
 | `PROJECT_DIR` | agent dir | Target project the agent edits |
-| `TASKS_FILE` | `$PROJECT_DIR/nodered/data/tasks.json` | Task queue |
-| `IDEAS_FILE` | `$PROJECT_DIR/nodered/data/ideas.json` | Idea queue |
+| `TASKS_FILE` | `data/tasks.json` | Task queue |
+| `IDEAS_FILE` | `data/ideas.json` | Idea queue |
 | `GITHUB_TOKEN` | — | Required for GitHub Models PM backend + git push |
 | `CLI_PROVIDER` | `claude` | Default CLI provider |
 | `AGENT_POLL_INTERVAL` | `3600` | Seconds between poll cycles |
@@ -92,15 +97,40 @@ Key env vars:
 
 ## HTTP API
 
-The agent exposes a small HTTP server on `AGENT_TRIGGER_PORT`:
+The agent exposes an HTTP server on `AGENT_TRIGGER_PORT` (default 8099):
 
+**Web UI:**
+| Path | Description |
+|---|---|
+| `/` | Tasks + Ideas page |
+| `/pipeline.html` | Pipeline monitor + config |
+| `/css/*`, `/js/*` | Static assets from `web/` |
+| `/photos/*` | Uploaded photos from `data/photos/` |
+
+**Pipeline/Agent:**
 | Endpoint | Method | Description |
 |---|---|---|
 | `/trigger` | POST | `{"prompt":"..."}` → run pipeline; no body → wake polling loop |
-| `/status` | GET | Agent state, provider list, pipeline stage config |
+| `/status` | GET | Agent state, version, provider list, pipeline stage config |
 | `/implement/{id}` | POST | Run pipeline from code stage for a planned task/idea |
 | `/research` | POST | Start background research for an idea |
 | `/research-status/{id}` | GET | Poll research job status |
+| `/pipeline-output/{id}` | GET | List/view stage outputs for a pipeline run |
+| `/security-report/{id}` | GET | View security review report |
+
+**CRUD API:**
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/tasks` | GET/POST | List all tasks / create new task |
+| `/api/tasks/{id}` | PUT/DELETE | Update / delete task |
+| `/api/ideas` | GET/POST | List all ideas / create new idea |
+| `/api/ideas/{id}` | PUT/DELETE | Update / delete idea |
+| `/api/photos/upload` | POST | Multipart photo upload |
+| `/api/photos/{file}` | DELETE | Delete a photo |
+| `/api/pipeline-history` | GET | List completed pipeline runs |
+| `/api/pipeline-stats` | GET | Per-stage stats (CLI calls, subagents, tools) |
+| `/api/config/pipeline` | GET/PUT | Read/write pipeline.json |
+| `/api/config/providers` | GET/PUT | Read/write providers.json |
 
 ## Task / Idea JSON Schema
 

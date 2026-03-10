@@ -6,9 +6,10 @@ and pushes to production.
 
 Supported CLI providers are defined in providers.json.
 """
-AGENT_VERSION = "2026.03.09-v5"  # bump this to verify we're running the right code
+AGENT_VERSION = "2026.03.09-v6"  # bump this to verify we're running the right code
 
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -16,6 +17,8 @@ import time
 import subprocess
 import logging
 import threading
+import uuid
+from email.parser import BytesParser
 from enum import Enum
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -41,8 +44,10 @@ if ENV_FILE.exists():
 # ── Config ──────────────────────────────────────────────────────────────────
 _project_dir_setting = Path(os.environ.get("PROJECT_DIR", str(AGENT_DIR)))
 PROJECT_DIR   = _project_dir_setting if _project_dir_setting.is_dir() else AGENT_DIR
-TASKS_FILE    = Path(os.environ.get("TASKS_FILE", str(PROJECT_DIR / "nodered" / "data" / "tasks.json")))
-IDEAS_FILE    = Path(os.environ.get("IDEAS_FILE", str(PROJECT_DIR / "nodered" / "data" / "ideas.json")))
+DATA_DIR      = AGENT_DIR / "data"
+PHOTOS_DIR    = DATA_DIR / "photos"
+TASKS_FILE    = Path(os.environ.get("TASKS_FILE", str(DATA_DIR / "tasks.json")))
+IDEAS_FILE    = Path(os.environ.get("IDEAS_FILE", str(DATA_DIR / "ideas.json")))
 STATE_FILE    = AGENT_DIR / "agent-state.json"
 LOG_FILE      = AGENT_DIR / "agent.log"
 POLL_INTERVAL = int(os.environ.get("AGENT_POLL_INTERVAL", "3600"))
@@ -61,6 +66,9 @@ SESSION_DIR = Path(os.environ.get("AGENT_SESSION_DIR",
 AUTO_IMPLEMENT_DEFAULT = os.environ.get("AGENT_AUTO_IMPLEMENT_DEFAULT", "true").lower() == "true"
 
 # ── Runtime directories ─────────────────────────────────────────────────────
+DATA_DIR.mkdir(exist_ok=True)
+PHOTOS_DIR.mkdir(exist_ok=True)
+WEB_DIR = AGENT_DIR / "web"
 RESEARCH_DIR = AGENT_DIR / "research-output"
 RESEARCH_DIR.mkdir(exist_ok=True)
 SECURITY_REVIEW_DIR = AGENT_DIR / "security-reviews"
@@ -1376,7 +1384,7 @@ class TriggerHandler(BaseHTTPRequestHandler):
 
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _json(self, code: int, data: dict):
@@ -1386,6 +1394,28 @@ class TriggerHandler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_file(self, file_path: Path, allowed_root: Path):
+        """Serve a static file with path-traversal protection."""
+        try:
+            resolved = file_path.resolve()
+            if not str(resolved).startswith(str(allowed_root.resolve())):
+                self._json(403, {"ok": False, "error": "Forbidden"})
+                return
+            if not resolved.is_file():
+                self._json(404, {"ok": False, "error": "Not found"})
+                return
+            content_type, _ = mimetypes.guess_type(str(resolved))
+            content_type = content_type or "application/octet-stream"
+            data = resolved.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            self._json(500, {"ok": False, "error": str(e)})
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -1463,13 +1493,146 @@ class TriggerHandler(BaseHTTPRequestHandler):
             threading.Thread(target=run_research, args=(idea_id, title, desc), daemon=True).start()
             log.info("🔬 Research triggered for idea: %s", title)
             self._json(200, {"ok": True, "message": "Research started!"})
+
+        elif self.path.rstrip("/") == "/api/tasks":
+            body = self._read_body()
+            if body is None:
+                return
+            body["id"] = body.get("id") or generateId()
+            body.setdefault("created", _ts_ms())
+            body.setdefault("updated", _ts_ms())
+            body.setdefault("status", "open")
+            all_tasks = load_tasks()
+            all_tasks.insert(0, body)
+            save_tasks(all_tasks)
+            self._json(201, body)
+
+        elif self.path.rstrip("/") == "/api/ideas":
+            body = self._read_body()
+            if body is None:
+                return
+            body["id"] = body.get("id") or generateId()
+            body.setdefault("created", _ts_ms())
+            body.setdefault("updated", _ts_ms())
+            body.setdefault("status", "open")
+            all_ideas = load_ideas()
+            all_ideas.insert(0, body)
+            save_ideas(all_ideas)
+            self._json(201, body)
+
+        elif self.path.rstrip("/") == "/api/photos/upload":
+            self._handle_photo_upload()
+
+        else:
+            self._json(404, {"ok": False, "error": "Not found"})
+
+    def do_PUT(self):
+        if self.path.startswith("/api/tasks/"):
+            item_id = self.path.split("/api/tasks/", 1)[1].rstrip("/")
+            body = self._read_body()
+            if body is None:
+                return
+            all_tasks = load_tasks()
+            found = False
+            for t in all_tasks:
+                if t.get("id") == item_id:
+                    t.update(body)
+                    t["updated"] = _ts_ms()
+                    found = True
+                    break
+            if not found:
+                self._json(404, {"ok": False, "error": "Task not found"})
+                return
+            save_tasks(all_tasks)
+            self._json(200, {"ok": True})
+
+        elif self.path.startswith("/api/ideas/"):
+            item_id = self.path.split("/api/ideas/", 1)[1].rstrip("/")
+            body = self._read_body()
+            if body is None:
+                return
+            all_ideas = load_ideas()
+            found = False
+            for i in all_ideas:
+                if i.get("id") == item_id:
+                    i.update(body)
+                    i["updated"] = _ts_ms()
+                    found = True
+                    break
+            if not found:
+                self._json(404, {"ok": False, "error": "Idea not found"})
+                return
+            save_ideas(all_ideas)
+            self._json(200, {"ok": True})
+
+        elif self.path.rstrip("/") == "/api/config/pipeline":
+            body = self._read_body()
+            if body is None:
+                return
+            pipeline_file = Path(os.environ.get("PIPELINE_FILE", str(AGENT_DIR / "pipeline.json")))
+            pipeline_file.write_text(json.dumps(body, indent=2), encoding="utf-8")
+            self._json(200, {"ok": True})
+
+        elif self.path.rstrip("/") == "/api/config/providers":
+            body = self._read_body()
+            if body is None:
+                return
+            PROVIDERS_FILE.write_text(json.dumps(body, indent=2), encoding="utf-8")
+            self._json(200, {"ok": True})
+
+        else:
+            self._json(404, {"ok": False, "error": "Not found"})
+
+    def do_DELETE(self):
+        if self.path.startswith("/api/tasks/"):
+            item_id = self.path.split("/api/tasks/", 1)[1].rstrip("/")
+            all_tasks = load_tasks()
+            all_tasks = [t for t in all_tasks if t.get("id") != item_id]
+            save_tasks(all_tasks)
+            self._json(200, {"ok": True})
+
+        elif self.path.startswith("/api/ideas/"):
+            item_id = self.path.split("/api/ideas/", 1)[1].rstrip("/")
+            all_ideas = load_ideas()
+            all_ideas = [i for i in all_ideas if i.get("id") != item_id]
+            save_ideas(all_ideas)
+            self._json(200, {"ok": True})
+
+        elif self.path.startswith("/api/photos/"):
+            filename = self.path.split("/api/photos/", 1)[1].rstrip("/")
+            photo_path = (PHOTOS_DIR / filename).resolve()
+            if not str(photo_path).startswith(str(PHOTOS_DIR.resolve())):
+                self._json(403, {"ok": False, "error": "Forbidden"})
+                return
+            if photo_path.exists():
+                photo_path.unlink()
+            self._json(200, {"ok": True})
+
         else:
             self._json(404, {"ok": False, "error": "Not found"})
 
     def do_GET(self):
-        if self.path.rstrip("/") == "/status":
+        path = self.path.split("?")[0]  # strip query params
+
+        # ── Static file serving ─────────────────────────────────────────
+        if path in ("/", "/index.html"):
+            self._serve_file(WEB_DIR / "index.html", WEB_DIR)
+            return
+        if path == "/pipeline.html":
+            self._serve_file(WEB_DIR / "pipeline.html", WEB_DIR)
+            return
+        if path.startswith("/css/") or path.startswith("/js/"):
+            self._serve_file(WEB_DIR / path.lstrip("/"), WEB_DIR)
+            return
+        if path.startswith("/photos/"):
+            self._serve_file(PHOTOS_DIR / path.split("/photos/", 1)[1], PHOTOS_DIR)
+            return
+
+        # ── API endpoints ───────────────────────────────────────────────
+        if path.rstrip("/") == "/status":
             with status_lock:
                 snap = dict(agent_status)
+            snap["version"] = AGENT_VERSION
             snap["providers"] = list_available_providers()
             snap["default_provider"] = os.environ.get("CLI_PROVIDER",
                                         _load_providers().get("default_provider", "claude"))
@@ -1488,15 +1651,42 @@ class TriggerHandler(BaseHTTPRequestHandler):
                 pipeline_cfg.get("program_manager", {}).get("backend", "github_models")
             )
             self._json(200, snap)
-        elif self.path.startswith("/research-status/"):
-            idea_id = self.path.split("/research-status/", 1)[1].rstrip("/")
+
+        elif path.rstrip("/") == "/api/tasks":
+            self._json(200, load_tasks())
+
+        elif path.rstrip("/") == "/api/ideas":
+            self._json(200, load_ideas())
+
+        elif path.rstrip("/") == "/api/pipeline-history":
+            runs = []
+            if PIPELINE_OUTPUT_DIR.exists():
+                for d in sorted(PIPELINE_OUTPUT_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                    if d.is_dir():
+                        runs.append({
+                            "task_id": d.name,
+                            "timestamp": datetime.fromtimestamp(d.stat().st_mtime).isoformat(),
+                            "stages": [f.stem for f in sorted(d.glob("*.md")) if not f.name.startswith(".")],
+                        })
+            self._json(200, {"runs": runs})
+
+        elif path.rstrip("/") == "/api/pipeline-stats":
+            self._json(200, {"stats": _get_pipeline_stats_summary()})
+
+        elif path.rstrip("/") == "/api/config/pipeline":
+            self._json(200, load_pipeline())
+
+        elif path.rstrip("/") == "/api/config/providers":
+            self._json(200, _load_providers())
+
+        elif path.startswith("/research-status/"):
+            idea_id = path.split("/research-status/", 1)[1].rstrip("/")
             with research_lock:
                 job = research_jobs.get(idea_id, {"status": "idle", "result": None})
             self._json(200, job)
-        elif self.path.startswith("/pipeline-output/"):
-            # /pipeline-output/{task_id} → list all stage outputs
-            # /pipeline-output/{task_id}/{stage} → single stage output
-            parts = self.path.split("/pipeline-output/", 1)[1].rstrip("/").split("/", 1)
+
+        elif path.startswith("/pipeline-output/"):
+            parts = path.split("/pipeline-output/", 1)[1].rstrip("/").split("/", 1)
             task_id = parts[0]
             stage = parts[1] if len(parts) > 1 else None
             task_dir = PIPELINE_OUTPUT_DIR / task_id
@@ -1515,9 +1705,9 @@ class TriggerHandler(BaseHTTPRequestHandler):
                     if not f.name.startswith("."):
                         files[f.stem] = f.read_text(encoding="utf-8")
                 self._json(200, {"ok": True, "task_id": task_id, "stages": files})
-        elif self.path.startswith("/security-report/"):
-            task_id = self.path.split("/security-report/", 1)[1].rstrip("/")
-            # Look for any file in SECURITY_REVIEW_DIR that starts with the task id
+
+        elif path.startswith("/security-report/"):
+            task_id = path.split("/security-report/", 1)[1].rstrip("/")
             report_text = None
             for candidate in SECURITY_REVIEW_DIR.iterdir():
                 if candidate.stem.startswith(task_id) or task_id in candidate.stem:
@@ -1530,6 +1720,7 @@ class TriggerHandler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "report": report_text})
             else:
                 self._json(404, {"ok": False, "error": "No security report found for this task"})
+
         else:
             self._json(404, {"ok": False, "error": "Not found"})
 
@@ -1542,6 +1733,67 @@ class TriggerHandler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"ok": False, "error": "Invalid JSON"})
             return None
+
+    def _handle_photo_upload(self):
+        """Parse multipart form data and save uploaded photo."""
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self._json(400, {"ok": False, "error": "Expected multipart/form-data"})
+            return
+        cl = int(self.headers.get("Content-Length", 0))
+        if cl <= 0 or cl > 10 * 1024 * 1024:  # 10MB limit
+            self._json(400, {"ok": False, "error": "Invalid content length (max 10MB)"})
+            return
+        raw = self.rfile.read(cl)
+        # Extract boundary from Content-Type
+        boundary = None
+        for part in content_type.split(";"):
+            part = part.strip()
+            if part.startswith("boundary="):
+                boundary = part.split("=", 1)[1].strip().strip('"')
+                break
+        if not boundary:
+            self._json(400, {"ok": False, "error": "No boundary in multipart"})
+            return
+        # Split on boundary and find the file part
+        boundary_bytes = b"--" + boundary.encode()
+        parts = raw.split(boundary_bytes)
+        for part in parts:
+            if b"filename=" not in part:
+                continue
+            # Split headers from body
+            header_end = part.find(b"\r\n\r\n")
+            if header_end < 0:
+                continue
+            headers_raw = part[:header_end].decode("utf-8", errors="replace")
+            file_data = part[header_end + 4:]
+            # Remove trailing \r\n-- if present
+            if file_data.endswith(b"\r\n"):
+                file_data = file_data[:-2]
+            if file_data.endswith(b"--"):
+                file_data = file_data[:-2]
+            if file_data.endswith(b"\r\n"):
+                file_data = file_data[:-2]
+            # Extract original filename for extension
+            ext = ".jpg"
+            for h in headers_raw.split("\r\n"):
+                if "filename=" in h:
+                    fname = h.split("filename=", 1)[1].strip().strip('"')
+                    if "." in fname:
+                        ext = "." + fname.rsplit(".", 1)[1].lower()
+                    break
+            # Save with uuid prefix
+            safe_name = f"{uuid.uuid4().hex[:12]}{ext}"
+            (PHOTOS_DIR / safe_name).write_bytes(file_data)
+            self._json(200, {"ok": True, "filename": safe_name})
+            return
+        self._json(400, {"ok": False, "error": "No file found in upload"})
+
+
+def generateId() -> str:
+    """Generate a unique ID for tasks/ideas."""
+    import time as _t
+    return f"{int(_t.time() * 1000):x}-{uuid.uuid4().hex[:6]}"
 
 
 def start_trigger_server():
@@ -1608,11 +1860,8 @@ def load_tasks() -> list:
         return []
 
 def save_tasks(tasks: list):
+    TASKS_FILE.parent.mkdir(parents=True, exist_ok=True)
     TASKS_FILE.write_text(json.dumps(tasks, indent=2), encoding="utf-8")
-    try:
-        requests.post("http://localhost:3000/api/tasks-save", json=tasks, timeout=5)
-    except Exception:
-        pass
 
 def load_ideas() -> list:
     if not IDEAS_FILE.exists():
@@ -1624,11 +1873,8 @@ def load_ideas() -> list:
         return []
 
 def save_ideas(ideas: list):
+    IDEAS_FILE.parent.mkdir(parents=True, exist_ok=True)
     IDEAS_FILE.write_text(json.dumps(ideas, indent=2), encoding="utf-8")
-    try:
-        requests.post("http://localhost:3000/api/ideas-save", json=ideas, timeout=5)
-    except Exception:
-        pass
 
 
 # ── Status helpers ──────────────────────────────────────────────────────────
