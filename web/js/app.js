@@ -50,6 +50,9 @@ function renderMarkdown(text) {
     // Clean up
     html = html.replace(/<br><\/ul>/g, '</ul>');
     html = html.replace(/<ul><br>/g, '<ul>');
+    // Remove <br> inside <pre> blocks (newlines are preserved by CSS white-space)
+    html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (m, code) =>
+        '<pre><code>' + code.replace(/<br>/g, '\n') + '</code></pre>');
     return html;
 }
 
@@ -68,6 +71,3 @@ function timeAgo(dateStr) {
     return diffD + 'd ago';
 }
 
-function generateId() {
-    return Date.now().toString(36) + Math.random().toString(36).substr(2, 6);
-}

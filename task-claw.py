@@ -18,7 +18,6 @@ import subprocess
 import logging
 import threading
 import uuid
-from email.parser import BytesParser
 from enum import Enum
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -69,6 +68,9 @@ AUTO_IMPLEMENT_DEFAULT = os.environ.get("AGENT_AUTO_IMPLEMENT_DEFAULT", "true").
 DATA_DIR.mkdir(exist_ok=True)
 PHOTOS_DIR.mkdir(exist_ok=True)
 WEB_DIR = AGENT_DIR / "web"
+# Pre-resolve for path-traversal checks in _serve_file (avoid resolving on every request)
+_WEB_DIR_RESOLVED = str(WEB_DIR.resolve())
+_PHOTOS_DIR_RESOLVED = str(PHOTOS_DIR.resolve())
 RESEARCH_DIR = AGENT_DIR / "research-output"
 RESEARCH_DIR.mkdir(exist_ok=True)
 SECURITY_REVIEW_DIR = AGENT_DIR / "security-reviews"
@@ -158,6 +160,14 @@ def _get_pipeline_stats_summary() -> dict:
     """Return a copy of current pipeline stats."""
     with _pipeline_stats_lock:
         return {stage: dict(data) for stage, data in _pipeline_stats.items()}
+
+
+def _get_stage_stats(stage_name: str) -> dict:
+    """Get stats for a specific pipeline stage. Returns copy."""
+    with _pipeline_stats_lock:
+        data = _pipeline_stats.get(stage_name, {"cli_calls": 0, "subagents": 0, "tool_calls": {}})
+        return {"cli_calls": data["cli_calls"], "subagents": data["subagents"],
+                "tool_calls": dict(data.get("tool_calls", {}))}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1395,11 +1405,11 @@ class TriggerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_file(self, file_path: Path, allowed_root: Path):
+    def _serve_file(self, file_path: Path, allowed_root_resolved: str):
         """Serve a static file with path-traversal protection."""
         try:
             resolved = file_path.resolve()
-            if not str(resolved).startswith(str(allowed_root.resolve())):
+            if not str(resolved).startswith(allowed_root_resolved):
                 self._json(403, {"ok": False, "error": "Forbidden"})
                 return
             if not resolved.is_file():
@@ -1495,30 +1505,10 @@ class TriggerHandler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "message": "Research started!"})
 
         elif self.path.rstrip("/") == "/api/tasks":
-            body = self._read_body()
-            if body is None:
-                return
-            body["id"] = body.get("id") or generateId()
-            body.setdefault("created", _ts_ms())
-            body.setdefault("updated", _ts_ms())
-            body.setdefault("status", "open")
-            all_tasks = load_tasks()
-            all_tasks.insert(0, body)
-            save_tasks(all_tasks)
-            self._json(201, body)
+            self._create_item(load_tasks, save_tasks)
 
         elif self.path.rstrip("/") == "/api/ideas":
-            body = self._read_body()
-            if body is None:
-                return
-            body["id"] = body.get("id") or generateId()
-            body.setdefault("created", _ts_ms())
-            body.setdefault("updated", _ts_ms())
-            body.setdefault("status", "open")
-            all_ideas = load_ideas()
-            all_ideas.insert(0, body)
-            save_ideas(all_ideas)
-            self._json(201, body)
+            self._create_item(load_ideas, save_ideas)
 
         elif self.path.rstrip("/") == "/api/photos/upload":
             self._handle_photo_upload()
@@ -1529,41 +1519,11 @@ class TriggerHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         if self.path.startswith("/api/tasks/"):
             item_id = self.path.split("/api/tasks/", 1)[1].rstrip("/")
-            body = self._read_body()
-            if body is None:
-                return
-            all_tasks = load_tasks()
-            found = False
-            for t in all_tasks:
-                if t.get("id") == item_id:
-                    t.update(body)
-                    t["updated"] = _ts_ms()
-                    found = True
-                    break
-            if not found:
-                self._json(404, {"ok": False, "error": "Task not found"})
-                return
-            save_tasks(all_tasks)
-            self._json(200, {"ok": True})
+            self._update_item(item_id, load_tasks, save_tasks, "Task")
 
         elif self.path.startswith("/api/ideas/"):
             item_id = self.path.split("/api/ideas/", 1)[1].rstrip("/")
-            body = self._read_body()
-            if body is None:
-                return
-            all_ideas = load_ideas()
-            found = False
-            for i in all_ideas:
-                if i.get("id") == item_id:
-                    i.update(body)
-                    i["updated"] = _ts_ms()
-                    found = True
-                    break
-            if not found:
-                self._json(404, {"ok": False, "error": "Idea not found"})
-                return
-            save_ideas(all_ideas)
-            self._json(200, {"ok": True})
+            self._update_item(item_id, load_ideas, save_ideas, "Idea")
 
         elif self.path.rstrip("/") == "/api/config/pipeline":
             body = self._read_body()
@@ -1586,22 +1546,16 @@ class TriggerHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if self.path.startswith("/api/tasks/"):
             item_id = self.path.split("/api/tasks/", 1)[1].rstrip("/")
-            all_tasks = load_tasks()
-            all_tasks = [t for t in all_tasks if t.get("id") != item_id]
-            save_tasks(all_tasks)
-            self._json(200, {"ok": True})
+            self._delete_item(item_id, load_tasks, save_tasks)
 
         elif self.path.startswith("/api/ideas/"):
             item_id = self.path.split("/api/ideas/", 1)[1].rstrip("/")
-            all_ideas = load_ideas()
-            all_ideas = [i for i in all_ideas if i.get("id") != item_id]
-            save_ideas(all_ideas)
-            self._json(200, {"ok": True})
+            self._delete_item(item_id, load_ideas, save_ideas)
 
         elif self.path.startswith("/api/photos/"):
             filename = self.path.split("/api/photos/", 1)[1].rstrip("/")
             photo_path = (PHOTOS_DIR / filename).resolve()
-            if not str(photo_path).startswith(str(PHOTOS_DIR.resolve())):
+            if not str(photo_path).startswith(_PHOTOS_DIR_RESOLVED):
                 self._json(403, {"ok": False, "error": "Forbidden"})
                 return
             if photo_path.exists():
@@ -1616,16 +1570,16 @@ class TriggerHandler(BaseHTTPRequestHandler):
 
         # ── Static file serving ─────────────────────────────────────────
         if path in ("/", "/index.html"):
-            self._serve_file(WEB_DIR / "index.html", WEB_DIR)
+            self._serve_file(WEB_DIR / "index.html", _WEB_DIR_RESOLVED)
             return
         if path == "/pipeline.html":
-            self._serve_file(WEB_DIR / "pipeline.html", WEB_DIR)
+            self._serve_file(WEB_DIR / "pipeline.html", _WEB_DIR_RESOLVED)
             return
         if path.startswith("/css/") or path.startswith("/js/"):
-            self._serve_file(WEB_DIR / path.lstrip("/"), WEB_DIR)
+            self._serve_file(WEB_DIR / path.lstrip("/"), _WEB_DIR_RESOLVED)
             return
         if path.startswith("/photos/"):
-            self._serve_file(PHOTOS_DIR / path.split("/photos/", 1)[1], PHOTOS_DIR)
+            self._serve_file(PHOTOS_DIR / path.split("/photos/", 1)[1], _PHOTOS_DIR_RESOLVED)
             return
 
         # ── API endpoints ───────────────────────────────────────────────
@@ -1724,7 +1678,43 @@ class TriggerHandler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"ok": False, "error": "Not found"})
 
-    # helpers
+    # ── CRUD helpers ──────────────────────────────────────────────────
+
+    def _create_item(self, loader, saver):
+        """Create a new task or idea."""
+        body = self._read_body()
+        if body is None:
+            return
+        body["id"] = body.get("id") or generateId()
+        body.setdefault("created", _ts_ms())
+        body.setdefault("updated", _ts_ms())
+        body.setdefault("status", "open")
+        items = loader()
+        items.insert(0, body)
+        saver(items)
+        self._json(201, body)
+
+    def _update_item(self, item_id: str, loader, saver, label: str):
+        """Update a task or idea by ID."""
+        body = self._read_body()
+        if body is None:
+            return
+        items = loader()
+        for item in items:
+            if item.get("id") == item_id:
+                item.update(body)
+                item["updated"] = _ts_ms()
+                saver(items)
+                self._json(200, {"ok": True})
+                return
+        self._json(404, {"ok": False, "error": f"{label} not found"})
+
+    def _delete_item(self, item_id: str, loader, saver):
+        """Delete a task or idea by ID."""
+        items = loader()
+        saver([i for i in items if i.get("id") != item_id])
+        self._json(200, {"ok": True})
+
     def _read_body(self) -> dict | None:
         cl = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(cl) if cl else b""
@@ -1792,8 +1782,7 @@ class TriggerHandler(BaseHTTPRequestHandler):
 
 def generateId() -> str:
     """Generate a unique ID for tasks/ideas."""
-    import time as _t
-    return f"{int(_t.time() * 1000):x}-{uuid.uuid4().hex[:6]}"
+    return f"{int(time.time() * 1000):x}-{uuid.uuid4().hex[:6]}"
 
 
 def start_trigger_server():

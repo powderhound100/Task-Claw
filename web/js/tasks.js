@@ -390,12 +390,17 @@ function handlePhotoSelect(e) {
     renderPhotoPreviews();
 }
 
+let _previewUrls = [];
 function renderPhotoPreviews() {
     const container = document.getElementById('photoPreviews');
     if (!container) return;
+    // Revoke previous ObjectURLs to prevent memory leaks
+    _previewUrls.forEach(u => URL.revokeObjectURL(u));
+    _previewUrls = [];
     let html = '';
     pendingPhotos.forEach((f, i) => {
         const url = URL.createObjectURL(f);
+        _previewUrls.push(url);
         html += '<div class="photo-thumb">';
         html += '<img src="' + url + '" alt="">';
         html += '<button class="remove-btn" onclick="removePendingPhoto(' + i + ')">&times;</button>';
