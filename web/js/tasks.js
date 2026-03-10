@@ -10,6 +10,7 @@ let activeIdeaFilter = 'all';
 let pendingPhotos = [];
 let currentView = 'tasks'; // 'tasks' or 'ideas'
 let pollTimer = null;
+const PIPELINE_STAGES = ['rewrite', 'plan', 'code', 'simplify', 'test', 'review', 'publish'];
 
 // ========================
 // DATA
@@ -230,11 +231,10 @@ function renderPipelineOverview() {
         return;
     }
     el.style.display = '';
-    const stages = ['rewrite', 'plan', 'code', 'simplify', 'test', 'review', 'publish'];
     let html = '<div class="pipeline-strip">';
-    stages.forEach((s, i) => {
+    PIPELINE_STAGES.forEach((s, i) => {
         html += '<span class="pipeline-dot" id="dot-' + s + '">' + s + '</span>';
-        if (i < stages.length - 1) html += '<span class="pipeline-arrow">&rarr;</span>';
+        if (i < PIPELINE_STAGES.length - 1) html += '<span class="pipeline-arrow">&rarr;</span>';
     });
     html += '</div>';
     el.innerHTML = html;
@@ -622,9 +622,8 @@ async function fetchAgentStatus() {
         renderAgentStatusBar(data);
         // Update pipeline overview dots
         if (data.current_stage) {
-            const stages = ['rewrite', 'plan', 'code', 'simplify', 'test', 'review', 'publish'];
-            const activeIdx = stages.indexOf(data.current_stage);
-            stages.forEach((s, i) => {
+            const activeIdx = PIPELINE_STAGES.indexOf(data.current_stage);
+            PIPELINE_STAGES.forEach((s, i) => {
                 const dot = document.getElementById('dot-' + s);
                 if (dot) {
                     dot.className = 'pipeline-dot' + (i < activeIdx ? ' completed' : i === activeIdx ? ' active' : '');

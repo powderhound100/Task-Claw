@@ -28,6 +28,18 @@ function escHtml(s) {
 function renderMarkdown(text) {
     if (!text) return '';
     let html = escHtml(text);
+    // Extract code blocks first to protect them from inline transforms
+    const codeBlocks = [];
+    html = html.replace(/```[\s\S]*?```/g, m => {
+        const code = m.replace(/```\w*\n?/, '').replace(/\n?```$/, '');
+        codeBlocks.push('<pre><code>' + code + '</code></pre>');
+        return '\x00CB' + (codeBlocks.length - 1) + '\x00';
+    });
+    // Extract inline code
+    html = html.replace(/`([^`]+)`/g, (m, code) => {
+        codeBlocks.push('<code>' + code + '</code>');
+        return '\x00CB' + (codeBlocks.length - 1) + '\x00';
+    });
     // Headers
     html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
     html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
@@ -35,13 +47,6 @@ function renderMarkdown(text) {
     // Bold / italic
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-    // Code
-    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-    // Code blocks
-    html = html.replace(/```[\s\S]*?```/g, m => {
-        const code = m.replace(/```\w*\n?/, '').replace(/\n?```$/, '');
-        return '<pre><code>' + code + '</code></pre>';
-    });
     // Lists
     html = html.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
     html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
@@ -50,9 +55,8 @@ function renderMarkdown(text) {
     // Clean up
     html = html.replace(/<br><\/ul>/g, '</ul>');
     html = html.replace(/<ul><br>/g, '<ul>');
-    // Remove <br> inside <pre> blocks (newlines are preserved by CSS white-space)
-    html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (m, code) =>
-        '<pre><code>' + code.replace(/<br>/g, '\n') + '</code></pre>');
+    // Restore code blocks (they keep original newlines, no <br> injection)
+    html = html.replace(/\x00CB(\d+)\x00/g, (m, idx) => codeBlocks[parseInt(idx)]);
     return html;
 }
 

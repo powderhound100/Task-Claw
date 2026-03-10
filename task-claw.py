@@ -1587,9 +1587,10 @@ class TriggerHandler(BaseHTTPRequestHandler):
             with status_lock:
                 snap = dict(agent_status)
             snap["version"] = AGENT_VERSION
-            snap["providers"] = list_available_providers()
+            providers_cfg = _load_providers()
+            snap["providers"] = {k: v.get("name", k) for k, v in providers_cfg.get("providers", {}).items()}
             snap["default_provider"] = os.environ.get("CLI_PROVIDER",
-                                        _load_providers().get("default_provider", "claude"))
+                                        providers_cfg.get("default_provider", "claude"))
             snap["default_planning_backend"] = DEFAULT_PLANNING_BACKEND
             snap["session_dir"] = str(SESSION_DIR)
             pipeline_cfg = load_pipeline()
@@ -1615,13 +1616,17 @@ class TriggerHandler(BaseHTTPRequestHandler):
         elif path.rstrip("/") == "/api/pipeline-history":
             runs = []
             if PIPELINE_OUTPUT_DIR.exists():
-                for d in sorted(PIPELINE_OUTPUT_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                dirs = []
+                for d in PIPELINE_OUTPUT_DIR.iterdir():
                     if d.is_dir():
-                        runs.append({
-                            "task_id": d.name,
-                            "timestamp": datetime.fromtimestamp(d.stat().st_mtime).isoformat(),
-                            "stages": [f.stem for f in sorted(d.glob("*.md")) if not f.name.startswith(".")],
-                        })
+                        dirs.append((d, d.stat().st_mtime))
+                dirs.sort(key=lambda x: x[1], reverse=True)
+                for d, mtime in dirs[:50]:  # limit to most recent 50
+                    runs.append({
+                        "task_id": d.name,
+                        "timestamp": datetime.fromtimestamp(mtime).isoformat(),
+                        "stages": [f.stem for f in sorted(d.glob("*.md")) if not f.name.startswith(".")],
+                    })
             self._json(200, {"runs": runs})
 
         elif path.rstrip("/") == "/api/pipeline-stats":
@@ -1712,7 +1717,9 @@ class TriggerHandler(BaseHTTPRequestHandler):
     def _delete_item(self, item_id: str, loader, saver):
         """Delete a task or idea by ID."""
         items = loader()
-        saver([i for i in items if i.get("id") != item_id])
+        filtered = [i for i in items if i.get("id") != item_id]
+        if len(filtered) < len(items):
+            saver(filtered)
         self._json(200, {"ok": True})
 
     def _read_body(self) -> dict | None:

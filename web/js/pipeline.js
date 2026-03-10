@@ -246,10 +246,10 @@ function renderProviderList(cfg) {
     el.innerHTML = html;
 }
 
-function showConfigTab(tab) {
+function showConfigTab(tab, evt) {
     currentConfigTab = tab;
     document.querySelectorAll('.config-editor .tab').forEach(t => t.classList.remove('active'));
-    event.target.classList.add('active');
+    if (evt && evt.target) evt.target.classList.add('active');
     loadCurrentConfig();
 }
 
