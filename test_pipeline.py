@@ -545,13 +545,8 @@ class TestPipelineTestCodeLoopback(PipelineTestBase):
 
 
 class TestPipelinePublishGating(PipelineTestBase):
-    """Validates Phase 1a — test_passed flag gating publish.
+    """Validates Phase 1a — test_passed flag gating publish."""
 
-    NOTE: Currently publish is NOT gated on test results.
-    These tests document DESIRED behavior after Phase 1 changes.
-    """
-
-    @unittest.skip("Pending Phase 1a implementation")
     def test_test_failure_blocks_publish(self):
         def mock_run_team(stage_name, *args, **kwargs):
             if stage_name == "test":
@@ -567,7 +562,6 @@ class TestPipelinePublishGating(PipelineTestBase):
 
         self.assertFalse(result["published"])
 
-    @unittest.skip("Pending Phase 1a implementation")
     def test_test_pass_allows_publish(self):
         def mock_run_team(stage_name, *args, **kwargs):
             if stage_name == "test":

@@ -387,3 +387,250 @@
         grid-template-columns: 1fr;
     }
 }
+
+/* ============================================
+   Live Stage Details (Phase 5)
+   ============================================ */
+
+.live-stage-detail {
+    background: var(--bg-card);
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    margin-bottom: 8px;
+    overflow: hidden;
+    animation: fadeInStage 0.3s ease-in;
+}
+
+@keyframes fadeInStage {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.live-stage-detail.active-stage {
+    border-color: var(--accent);
+    box-shadow: 0 0 8px rgba(233, 69, 96, 0.15);
+}
+
+.live-stage-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.live-stage-header:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.stage-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    background: var(--bg-input);
+    color: var(--text);
+    text-transform: capitalize;
+}
+
+.stage-badge.active {
+    background: var(--accent);
+    color: #fff;
+}
+
+.verdict {
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.verdict.approve { background: rgba(76, 175, 80, 0.15); color: #4caf50; }
+.verdict.revise  { background: rgba(244, 67, 54, 0.15); color: #f44336; }
+.verdict.direct  { background: rgba(255, 193, 7, 0.15); color: #ffc107; }
+.verdict.done    { background: rgba(76, 175, 80, 0.15); color: #4caf50; }
+.verdict.running { background: rgba(233, 69, 96, 0.15); color: var(--accent); }
+.verdict.blocked { background: rgba(244, 67, 54, 0.15); color: #f44336; }
+
+.elapsed {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.team-label {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-left: auto;
+}
+
+.expand-toggle {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-left: 4px;
+}
+
+.stage-issues {
+    padding: 4px 14px 8px;
+    border-top: 1px solid var(--border);
+}
+
+.issue-item {
+    font-size: 0.8rem;
+    color: #ffc107;
+    padding: 2px 0;
+}
+
+.stage-output {
+    padding: 0 14px 12px;
+    border-top: 1px solid var(--border);
+}
+
+.stage-output pre {
+    font-family: "Cascadia Code", "Fira Code", monospace;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    background: var(--bg);
+    border-radius: 6px;
+    padding: 10px;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 8px 0 0;
+}
+
+.pulse-dot {
+    color: var(--accent);
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+.pipeline-elapsed {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    padding: 8px 12px;
+    background: var(--bg-card);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    margin-left: 8px;
+    white-space: nowrap;
+}
+
+/* ============================================
+   Comparison View (Phase 7c)
+   ============================================ */
+
+.comparison-section {
+    margin-top: 12px;
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+}
+
+.comparison-toggle {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 8px;
+}
+
+.comparison-toggle .btn {
+    padding: 3px 10px;
+    font-size: 0.72rem;
+}
+
+.comparison-view {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+}
+
+.comparison-view.side-by-side {
+    flex-direction: row;
+}
+
+.comparison-view.unified {
+    flex-direction: column;
+}
+
+.diff-pane {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.diff-pane-header {
+    background: var(--bg-input);
+    padding: 6px 10px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+}
+
+.diff-content {
+    font-family: "Cascadia Code", "Fira Code", monospace;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    padding: 8px;
+    max-height: 400px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0;
+}
+
+.diff-added { background: rgba(76, 175, 80, 0.1); }
+.diff-removed { background: rgba(244, 67, 54, 0.1); }
+.diff-common { background: transparent; }
+
+.cross-review-summary,
+.comparison-summary {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+
+.cross-review-summary h5,
+.comparison-summary h5 {
+    font-size: 0.85rem;
+    margin-bottom: 6px;
+}
+
+.review-entry {
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    background: var(--bg);
+    border-radius: 6px;
+}
+
+.review-entry pre {
+    font-size: 0.75rem;
+    margin: 4px 0 0;
+    max-height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
+
+/* --- Responsive additions --- */
+@media (max-width: 768px) {
+    .comparison-view.side-by-side {
+        flex-direction: column;
+    }
+
+    .live-stage-header {
+        flex-wrap: wrap;
+    }
+
+    .team-label {
+        margin-left: 0;
+        width: 100%;
+    }
+}

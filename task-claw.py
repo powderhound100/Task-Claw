@@ -6,11 +6,12 @@ and pushes to production.
 
 Supported CLI providers are defined in providers.json.
 """
-AGENT_VERSION = "2026.03.09-v6"  # bump this to verify we're running the right code
+AGENT_VERSION = "2026.03.11-v7"  # bump this to verify we're running the right code
 
 import json
 import mimetypes
 import os
+import random
 import re
 import sys
 import time
@@ -21,7 +22,7 @@ import uuid
 from enum import Enum
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from shutil import which
 
 import concurrent.futures
@@ -477,8 +478,8 @@ def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict,
         except requests.exceptions.HTTPError as e:
             status = getattr(e.response, "status_code", 0)
             if status in (429, 500, 502, 503, 504) and attempt < _retries:
-                wait = _backoff * (2 ** attempt)
-                log.warning("   PM API %d — retrying in %.0fs (attempt %d/%d)",
+                wait = _backoff * (2 ** attempt) + random.uniform(0, 1)
+                log.warning("   PM API %d — retrying in %.1fs (attempt %d/%d)",
                             status, wait, attempt + 1, _retries)
                 time.sleep(wait)
                 last_err = e
@@ -486,8 +487,8 @@ def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict,
             raise
         except requests.exceptions.Timeout as e:
             if attempt < _retries:
-                wait = _backoff * (2 ** attempt)
-                log.warning("   PM API timeout — retrying in %.0fs (attempt %d/%d)",
+                wait = _backoff * (2 ** attempt) + random.uniform(0, 1)
+                log.warning("   PM API timeout — retrying in %.1fs (attempt %d/%d)",
                             wait, attempt + 1, _retries)
                 time.sleep(wait)
                 last_err = e
@@ -526,7 +527,7 @@ def pm_direct_team(stage_name: str, original_prompt: str, context: str,
         return _build_direct_prompt(stage_name, original_prompt, context), False
 
 
-_GARBAGE_PATTERNS = [
+_GARBAGE_STRONG = [
     "what would you like", "could you share", "could you describe",
     "could you provide", "could you grant", "could you tell",
     "could you give", "could you let", "could you help",
@@ -536,23 +537,45 @@ _GARBAGE_PATTERNS = [
     "what bug are you", "message might be incomplete",
     "message got cut off", "plan handoff", "no plan content",
     "what do you want", "how can i help", "can you clarify",
-    "more information", "more details", "what specific",
-    "what exactly", "can you tell me", "need more context",
-    "i'd be happy to help", "i'll need to know",
-    "permission was denied", "permission denied",
+    "what specific", "what exactly", "can you tell me",
+    "need more context", "i'd be happy to help", "i'll need to know",
     "grant permission", "i need access", "need write permission",
     "need permission", "approve the edit", "can you confirm",
     "i need write", "write permission",
 ]
 
+_GARBAGE_WEAK = [
+    "more information", "more details",
+    "permission was denied", "permission denied",
+]
+
+# Combined flat list for line-level filtering in _clean_stage_output
+_GARBAGE_PATTERNS = _GARBAGE_STRONG + _GARBAGE_WEAK
+
 
 def _is_garbage_output(team_outputs: list) -> bool:
-    """Check if team output is garbage (questions, too short, permission asks, etc.)."""
+    """Check if team output is garbage (questions, too short, permission asks, etc.).
+    Uses tiered scoring: strong signals (multi-word phrases) = 2pts, weak signals = 1pt.
+    Weak signals only count if output is short (<500 chars) or has question marks.
+    Threshold = 2 points.
+    """
     total_len = sum(len(out) for _, out in team_outputs)
     if total_len < 100:  # Trivially short — almost always a permission denial or empty run
         return True
     all_output = " ".join(out.lower() for _, out in team_outputs)
-    return any(pat in all_output for pat in _GARBAGE_PATTERNS)
+    score = 0
+    for pat in _GARBAGE_STRONG:
+        if pat in all_output:
+            score += 2
+    if score >= 2:
+        return True
+    # Weak signals only count if output is short or contains question marks
+    is_short_or_questioning = total_len < 500 or '?' in all_output
+    if is_short_or_questioning:
+        for pat in _GARBAGE_WEAK:
+            if pat in all_output:
+                score += 1
+    return score >= 2
 
 
 def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
@@ -656,6 +679,18 @@ def _parse_overseer_response(text: str) -> dict:
     verdict_m = re.search(r'##\s*Verdict\s*\n\s*(APPROVE|REVISE)', text, re.IGNORECASE)
     if verdict_m:
         result["verdict"] = verdict_m.group(1).strip().lower()
+    else:
+        # No ## Verdict header — heuristic: look for explicit approval signals
+        lower = text.lower()
+        approval_signals = ["approved", "looks good", "meets requirements",
+                            "lgtm", "well done", "production-ready"]
+        if any(sig in lower for sig in approval_signals):
+            log.warning("   PM response missing ## Verdict — inferred APPROVE from text signals")
+            result["verdict"] = "approve"
+        else:
+            log.warning("   PM response missing ## Verdict and no approval signals — defaulting to REVISE")
+            result["verdict"] = "revise"
+            result["issues"].append("PM response was unstructured — flagged for review")
 
     # Extract issues
     issues_m = re.search(r'##\s*Issues\s*\n(.*?)(?=\n##|\Z)', text, re.DOTALL)
@@ -718,12 +753,15 @@ def cross_review_code(team_outputs: list, plan_context: str,
             f"Original request: {original_prompt}\n\n"
             f"Plan context:\n{plan_context}\n\n"
             f"Implementations to review:\n\n{other_blocks}\n\n"
-            "Perform a thorough code review. For each implementation:\n"
-            "1. **Correctness**: Does it fulfill the plan and original request?\n"
-            "2. **Gaps**: What requirements or edge cases are missing?\n"
-            "3. **Bugs**: Any logic errors, off-by-one, null checks, etc.?\n"
-            "4. **Strengths**: What does this implementation do particularly well?\n"
-            "5. **Suggestions**: Specific improvements with code snippets where helpful.\n\n"
+            "Perform a structured comparison review. Return your response in these sections:\n\n"
+            "## Agreement Points\n"
+            "[What both implementations do the same way]\n\n"
+            "## Divergences\n"
+            "[Specific differences, with file:line references]\n\n"
+            "## Winner Per Component\n"
+            "[For each feature/component, which implementation is better and why]\n\n"
+            "## Recommended Merge Strategy\n"
+            "[How to combine the best of both]\n\n"
             "Be specific and actionable. Reference file names and line numbers where possible."
         )
         try:
@@ -755,6 +793,19 @@ def cross_review_code(team_outputs: list, plan_context: str,
 
     log.info("   🔄 Cross-review complete: %d reviews collected", len(reviews))
     return reviews
+
+
+def _build_comparison_summary(team_outputs: list, cross_reviews: list) -> str:
+    """Extract structured sections from cross-reviews and build a comparison summary."""
+    summary_parts = []
+    for reviewer_name, review in cross_reviews:
+        summary_parts.append(f"### {reviewer_name}\n")
+        for section in ["Agreement Points", "Divergences", "Winner Per Component",
+                        "Recommended Merge Strategy"]:
+            m = re.search(rf'##\s*{section}\s*\n(.*?)(?=\n##|\Z)', review, re.DOTALL)
+            if m:
+                summary_parts.append(f"**{section}:** {m.group(1).strip()[:500]}\n")
+    return "\n".join(summary_parts) if summary_parts else "No structured comparison available."
 
 
 def pm_merge_with_reviews(stage_name: str, original_prompt: str, context: str,
@@ -903,16 +954,30 @@ def rewrite_prompt(raw_prompt: str, pm_cfg: dict) -> str:
 
 
 def _cap_context(context: str, max_chars: int = 12000) -> str:
-    """Cap context to max_chars by dropping oldest ## sections first."""
+    """Cap context to max_chars by dropping oldest non-plan sections first."""
     if len(context) <= max_chars:
         return context
-    sections = re.split(r'(?=## [A-Z])', context)
+    # Split on === ... === delimiters (actual format used in pipeline)
+    sections = re.split(r'(?==== )', context)
+    if len(sections) <= 1:
+        # Fallback: try ## headers
+        sections = re.split(r'(?=## [A-Z])', context)
+    # Never drop the Plan section
     while len("".join(sections)) > max_chars and len(sections) > 1:
-        sections.pop(0)
+        # Find oldest non-plan section to drop
+        dropped = False
+        for i in range(len(sections)):
+            if 'plan' not in sections[i].lower():
+                sections.pop(i)
+                dropped = True
+                break
+        if not dropped:
+            sections.pop(0)  # all plan sections, drop oldest
     return "".join(sections)
 
 
 MAX_REVISE_ATTEMPTS = int(os.environ.get("PIPELINE_MAX_REVISE", "1"))
+MAX_TEST_FIX_ATTEMPTS = 1  # Single code-fix attempt after test failures
 
 
 def _pm_health_check(pm_cfg: dict) -> bool:
@@ -922,6 +987,24 @@ def _pm_health_check(pm_cfg: dict) -> bool:
         log.warning("⚠️ PM health check: no GITHUB_TOKEN set")
         return False
     return True
+
+
+def _clean_stage_output(output: str) -> str:
+    """Strip garbage lines from stage output before appending to context."""
+    lines = output.split('\n')
+    clean = [l for l in lines if not any(p in l.lower() for p in _GARBAGE_PATTERNS)]
+    return '\n'.join(clean)
+
+
+def _extract_plan_context(context: str) -> str:
+    """Extract just the plan section from pipeline context."""
+    m = re.search(r'(=== Plan[^\n]*===.*?=== End plan ===)', context,
+                  re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # Fallback: try ## headers
+    m = re.search(r'(## Plan.*?)(?=\n## [A-Z]|\Z)', context, re.DOTALL)
+    return m.group(1) if m else ""
 
 
 def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
@@ -969,17 +1052,56 @@ def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
 def _test_found_failures(test_output: str) -> bool:
     """Check if test stage output indicates failures that need code fixes."""
     lower = test_output.lower()
-    failure_patterns = [
-        "fail", "error", "broken", "bug", "exception", "traceback",
-        "assert", "not working", "does not work", "crash", "undefined",
+    # Short keywords use word-boundary matching to avoid false positives
+    # (e.g. "errorHandler", "assertValid", "bugfix")
+    _short_failure_kws = [
+        "fail", "error", "broken", "bug", "crash", "assert",
+    ]
+    _long_failure_patterns = [
+        "exception", "traceback", "not working", "does not work", "undefined",
         "typeerror", "syntaxerror", "referenceerror", "attributeerror",
         "fix needed", "needs fix", "issue found", "issues found",
     ]
     # Don't trigger on "no failures" or "all tests passed"
-    pass_patterns = ["no fail", "no error", "all pass", "tests pass", "0 fail"]
+    pass_patterns = [
+        "no fail", "no error", "all pass", "tests pass", "0 fail",
+        "0 errors", "no issues", "success", "everything passed",
+        "all tests pass",
+    ]
     if any(pp in lower for pp in pass_patterns):
         return False
-    return any(fp in lower for fp in failure_patterns)
+    # Check long patterns with substring match
+    if any(fp in lower for fp in _long_failure_patterns):
+        return True
+    # Check short keywords with word boundary
+    for kw in _short_failure_kws:
+        if re.search(r'\b' + kw + r'\b', lower):
+            return True
+    return False
+
+
+def _extract_test_failures(output: str, max_chars: int = 4000) -> str:
+    """Extract relevant test failure lines with context. Falls back to tail truncation."""
+    lines = output.split('\n')
+    failure_pats = re.compile(
+        r'(fail|error|traceback|assert|exception|syntaxerror|typeerror'
+        r'|referenceerror|attributeerror|not working|does not work)',
+        re.IGNORECASE
+    )
+    relevant = []
+    for i, line in enumerate(lines):
+        if failure_pats.search(line):
+            # Include 2 lines before and after for context
+            start = max(0, i - 2)
+            end = min(len(lines), i + 3)
+            for j in range(start, end):
+                if j not in [r[0] for r in relevant]:
+                    relevant.append((j, lines[j]))
+    if relevant:
+        result = '\n'.join(line for _, line in sorted(relevant, key=lambda x: x[0]))
+        return result[:max_chars]
+    # Fallback: last max_chars of output
+    return output[-max_chars:]
 
 
 def _save_stage_output(task_id: str, stage: str, content: str,
@@ -1040,6 +1162,11 @@ def run_pipeline(prompt: str, task_id: str | None = None,
     original_prompt = prompt
     tid = task_id or f"pipeline-{int(time.time())}"
     pm_consecutive_failures = 0   # track PM failures to switch to direct mode
+    test_passed = True            # Phase 1a: gate publish on test results
+
+    # Phase 5e: expose pipeline start time for web UI elapsed display
+    with status_lock:
+        agent_status["pipeline_started"] = datetime.now(timezone.utc).isoformat()
 
     # ── Canary: write a marker file to prove this code ran ──────────────
     canary = AGENT_DIR / "_pipeline_canary.txt"
@@ -1091,6 +1218,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
         with status_lock:
             agent_status["state"] = f"pipeline:{stage}"
             agent_status["current_stage"] = stage
+            agent_status["stage_log"] = list(stage_log)  # snapshot for web UI
 
         # ── Rewrite: PM-only, no CLI team ───────────────────────────────────
         if stage == "rewrite":
@@ -1114,6 +1242,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                                "note": prompt[:200],
                                "output": prompt[:2000],
                                "output_file": str(_stage_output_path(tid, "rewrite"))})
+            with status_lock:
+                agent_status["stage_log"] = list(stage_log)
             continue
 
         # ── Review: use structured security review, PM oversees verdict ─────
@@ -1144,6 +1274,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                                "note": review.get("report", "")[:200],
                                "output": review.get("report", "")[:2000],
                                "output_file": str(_stage_output_path(tid, "review"))})
+            with status_lock:
+                agent_status["stage_log"] = list(stage_log)
             if action == "blocked":
                 log.warning("🔒 Pipeline blocked by security review for: %s", tid)
                 return {
@@ -1157,7 +1289,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 
         # ── Plan / Code / Test ─────────────────────────────────────────────
         # Use direct mode if PM is unavailable or has failed consecutively
-        use_direct = not pm_available or pm_consecutive_failures >= 1
+        use_direct = not pm_available or pm_consecutive_failures >= 2
 
         if use_direct:
             # ── DIRECT mode: no PM, send actionable prompts straight to CLI ──
@@ -1170,9 +1302,10 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 log.warning("⚠️ Stage '%s' — no team output, continuing", stage)
                 stage_results[stage] = ""
             elif _is_garbage_output(team_outputs):
-                # ── Garbage detected in direct mode — retry with clean prompt (no context) ──
-                log.warning("   ❌ [DIRECT] Garbage output from '%s' — retrying with clean prompt", stage)
-                clean_prompt = _build_direct_prompt(stage, prompt, "")  # no context = no garbage
+                # ── Garbage detected in direct mode — retry with plan context preserved ──
+                log.warning("   ❌ [DIRECT] Garbage output from '%s' — retrying with plan context only", stage)
+                plan_ctx = _extract_plan_context(context)
+                clean_prompt = _build_direct_prompt(stage, prompt, plan_ctx)
                 retry_outputs = run_team(stage, clean_prompt, team, "", timeout, task_id=tid)
                 if retry_outputs and not _is_garbage_output(retry_outputs):
                     if stage in ("code", "simplify"):
@@ -1180,7 +1313,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                     combined = "\n\n".join(out for _, out in retry_outputs)
                     stage_results[stage] = combined
                     _save_stage_output(tid, stage, combined, notes="Direct mode — retry after garbage.")
-                    context += f"\n\n=== {stage.capitalize()} stage output ===\n{combined[-3000:]}\n=== End {stage} ==="
+                    clean_out = _clean_stage_output(combined)
+                    context += f"\n\n=== {stage.capitalize()} stage output ===\n{clean_out[-3000:]}\n=== End {stage} ==="
                     context = _cap_context(context)
                 else:
                     log.warning("   ❌ [DIRECT] Retry also garbage for '%s' — skipping", stage)
@@ -1192,19 +1326,24 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 stage_results[stage] = combined
                 _save_stage_output(tid, stage, combined,
                                    notes="Direct mode — no PM oversight.")
-                context += f"\n\n=== {stage.capitalize()} stage output ===\n{combined[-3000:]}\n=== End {stage} ==="
+                clean_out = _clean_stage_output(combined)
+                context += f"\n\n=== {stage.capitalize()} stage output ===\n{clean_out[-3000:]}\n=== End {stage} ==="
                 context = _cap_context(context)
 
                 # ── Test→Code loopback: if test found failures, re-run code ──
                 if stage == "test" and _test_found_failures(combined):
                     log.warning("   🔄 Test found failures — looping back to code stage")
+                    test_passed = False
                     code_team = stages_cfg.get("code", {}).get("team", ["claude"])
                     code_timeout_val = int(os.environ.get("PIPELINE_CODE_TIMEOUT",
                                           str(stages_cfg.get("code", {}).get("timeout", 300))))
                     code_timeout = None if code_timeout_val == 0 else code_timeout_val
+                    test_failures = _extract_test_failures(combined)
                     fix_prompt = (
-                        f"{prompt}\n\n"
-                        f"Test failures to fix:\n{combined[-3000:]}"
+                        "The previous code changes caused test failures. "
+                        "Fix ONLY the failing tests — do not rewrite unrelated code.\n\n"
+                        f"Original task: {prompt}\n\n"
+                        f"Test failures:\n{test_failures}"
                     )
                     fix_outputs = run_team("code", fix_prompt, code_team, "",
                                           code_timeout, task_id=tid)
@@ -1216,6 +1355,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                         fix_combined = "\n\n".join(out for _, out in fix_outputs)
                         _save_stage_output(tid, "code-fix", fix_combined,
                                            notes="Code fix after test failures.")
+                        # Re-check if fix resolved the issues
+                        test_passed = not _test_found_failures(fix_combined)
                         context += f"\n\n=== Code fix output ===\n{fix_combined[-2000:]}\n=== End code fix ==="
                         context = _cap_context(context)
                         stage_log.append({"stage": "code-fix", "elapsed": 0,
@@ -1224,6 +1365,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                                           "note": fix_combined[:200],
                                           "output": fix_combined[:2000],
                                           "output_file": str(_stage_output_path(tid, "code-fix"))})
+                        with status_lock:
+                            agent_status["stage_log"] = list(stage_log)
 
             elapsed = time.time() - _stage_start
             log.info("   ✅ Stage '%s' done in %.0fs — DIRECT", stage, elapsed)
@@ -1232,6 +1375,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                                "note": (stage_results.get(stage) or "")[:200],
                                "output": (stage_results.get(stage) or "")[:2000],
                                "output_file": str(_stage_output_path(tid, stage))})
+            with status_lock:
+                agent_status["stage_log"] = list(stage_log)
             continue
 
         # ── Full PM mode: PM directs → team runs → PM oversees ───────────
@@ -1259,6 +1404,10 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 
             # ── Code stage with 2+ agents: cross-review + deep merge ────────
             if stage == "code" and len(team_outputs) >= 2:
+                # Save each agent's output separately
+                for agent_name, agent_output in team_outputs:
+                    _save_stage_output(tid, f"code-{agent_name}", agent_output,
+                                       notes=f"Individual implementation by {agent_name}")
                 cross_reviews = cross_review_code(
                     team_outputs, context, original_prompt, timeout
                 )
@@ -1267,6 +1416,10 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                         stage, original_prompt, context,
                         team_outputs, cross_reviews, pm_cfg
                     )
+                    pm_result["team_outputs"] = team_outputs
+                    pm_result["cross_reviews"] = cross_reviews
+                    pm_result["comparison_summary"] = _build_comparison_summary(
+                        team_outputs, cross_reviews)
                 else:
                     pm_result = pm_oversee_stage(
                         stage, original_prompt, context, team_outputs, pm_cfg
@@ -1307,11 +1460,16 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             if verdict == "revise":
                 log.warning("   ⚠️ PM verdict: REVISE but max attempts reached — proceeding with best effort")
 
+            # Track test results for publish gating
+            if stage == "test":
+                test_passed = verdict != "revise"
+
             # Approved (or max attempts reached) — record and move on
             stage_results[stage] = pm_result["full_response"]
             _save_stage_output(tid, stage, pm_result["full_response"],
                                notes=f"Verdict: {verdict} | Issues: {len(issues)}")
-            context += f"\n\n=== {stage.capitalize()} stage output ===\n{pm_result['handoff']}\n=== End {stage} ==="
+            clean_handoff = _clean_stage_output(pm_result['handoff'])
+            context += f"\n\n=== {stage.capitalize()} stage output ===\n{clean_handoff}\n=== End {stage} ==="
             context = _cap_context(context)
             elapsed = time.time() - _stage_start
             log.info("   ✅ Stage '%s' done in %.0fs — PM: %s", stage, elapsed, verdict.upper())
@@ -1320,17 +1478,23 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                                "note": pm_result.get("handoff", "")[:200],
                                "output": pm_result.get("synthesis", "")[:2000],
                                "output_file": str(_stage_output_path(tid, stage))})
+            with status_lock:
+                agent_status["stage_log"] = list(stage_log)
             break
 
     # ── Publish ──────────────────────────────────────────────────────────────
     published = False
-    if publish_cfg.get("enabled", True) and publish_cfg.get("auto_push", True):
+    if not test_passed:
+        log.warning("⛔ Skipping publish — test stage indicated failures")
+    elif publish_cfg.get("enabled", True) and publish_cfg.get("auto_push", True):
         title = prompt[:80] if not task_id else task_id
         log.info("📤 Publishing: %s", title)
         published = _git_commit_and_push(tid, title, label="pipeline")
 
     with status_lock:
         agent_status["state"] = "idle"
+        agent_status["stage_log"] = []
+        agent_status.pop("pipeline_started", None)
 
     # ── Pipeline stats summary ──────────────────────────────────────────────
     stats = _get_pipeline_stats_summary()

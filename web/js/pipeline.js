@@ -13,6 +13,7 @@ async function fetchStatus() {
         const data = await api('/status');
         renderAgentStatus(data);
         renderStageFlow(data);
+        renderLiveStageDetails(data);
         return data;
     } catch (e) {
         console.warn('Status fetch failed:', e);
@@ -43,26 +44,217 @@ function renderStageFlow(data) {
     const currentStage = data.current_stage;
     const isRunning = data.state && data.state.startsWith('pipeline:');
     const stages = data.pipeline_stages || {};
+    const completedStages = new Set((data.stage_log || []).map(e => e.stage));
 
     let html = '';
     PIPELINE_STAGES.forEach((stage, i) => {
         const cfg = stages[stage] || {};
         const enabled = cfg.enabled !== false;
         let cls = 'stage-node';
-        if (!enabled) cls += ' disabled';
-        else if (isRunning && stage === currentStage) cls += ' active';
-        else if (isRunning && PIPELINE_STAGES.indexOf(currentStage) > i) cls += ' completed';
-        else cls += ' pending';
+
+        // Find verdict for completed stages
+        const logEntry = (data.stage_log || []).find(e => e.stage === stage);
+        let verdictHtml = '';
+
+        if (!enabled) {
+            cls += ' disabled';
+        } else if (completedStages.has(stage)) {
+            cls += ' completed';
+            if (logEntry) {
+                const v = logEntry.verdict || '';
+                const vCls = v === 'approve' ? 'approve' : v === 'revise' ? 'revise' :
+                             v === 'blocked' ? 'revise' : 'direct';
+                verdictHtml = '<div class="stage-status-icon">&#10003;</div>';
+            }
+        } else if (isRunning && stage === currentStage) {
+            cls += ' active';
+            verdictHtml = '<div class="stage-status-icon pulse-dot">&#9679;</div>';
+        } else {
+            cls += ' pending';
+        }
 
         html += '<div class="' + cls + '">';
+        html += verdictHtml;
         html += '<div class="stage-name">' + escHtml(stage) + '</div>';
-        if (cfg.team) html += '<div class="stage-time">' + escHtml(cfg.team.join(', ')) + '</div>';
+        if (logEntry && logEntry.elapsed) {
+            html += '<div class="stage-time">' + logEntry.elapsed + 's</div>';
+        } else if (cfg.team) {
+            html += '<div class="stage-time">' + escHtml(cfg.team.join(', ')) + '</div>';
+        }
         html += '</div>';
         if (i < PIPELINE_STAGES.length - 1) {
             html += '<div class="stage-arrow">&#8594;</div>';
         }
     });
+
+    // Pipeline elapsed timer
+    if (isRunning && data.pipeline_started) {
+        const started = new Date(data.pipeline_started);
+        const elapsed = Math.round((Date.now() - started.getTime()) / 1000);
+        const mins = Math.floor(elapsed / 60);
+        const secs = elapsed % 60;
+        html += '<div class="pipeline-elapsed">Running: ' + mins + 'm ' + secs + 's</div>';
+    }
+
     flow.innerHTML = html;
+}
+
+function renderLiveStageDetails(data) {
+    const el = document.getElementById('monitorDetails');
+    if (!el) return;
+
+    const stageLog = data.stage_log || [];
+    const isRunning = data.state && data.state.startsWith('pipeline:');
+
+    if (stageLog.length === 0 && !isRunning) {
+        el.innerHTML = '';
+        return;
+    }
+
+    let html = '';
+
+    // Render completed stages
+    stageLog.forEach(entry => {
+        const v = entry.verdict || 'done';
+        const vCls = v === 'approve' ? 'approve' : v === 'revise' ? 'revise' :
+                     v === 'blocked' ? 'revise' : v === 'direct' ? 'direct' : 'done';
+
+        html += '<div class="live-stage-detail completed">';
+        html += '<div class="live-stage-header" onclick="toggleStageDetail(this)">';
+        html += '<span class="stage-badge">' + escHtml(entry.stage) + '</span>';
+        html += '<span class="verdict ' + vCls + '">' + escHtml(v.toUpperCase()) + '</span>';
+        html += '<span class="elapsed">' + (entry.elapsed || 0) + 's</span>';
+        if (entry.team) {
+            html += '<span class="team-label">' + escHtml(entry.team.join(', ')) + '</span>';
+        }
+        html += '<span class="expand-toggle">&#9660;</span>';
+        html += '</div>';
+
+        // Issues
+        if (entry.issues && entry.issues.length > 0) {
+            html += '<div class="stage-issues">';
+            entry.issues.forEach(iss => {
+                html += '<div class="issue-item">&#9888; ' + escHtml(iss) + '</div>';
+            });
+            html += '</div>';
+        }
+
+        // Output (collapsible)
+        html += '<div class="stage-output" style="display:none">';
+        if (entry.output) {
+            html += '<pre>' + escHtml(entry.output.substring(0, 2000)) + '</pre>';
+        }
+
+        // Comparison view for multi-agent stages
+        if (entry.team_outputs && entry.team_outputs.length > 1) {
+            html += renderComparisonView(entry);
+        }
+
+        html += '</div>';
+        html += '</div>';
+    });
+
+    // Active stage indicator
+    if (isRunning && data.current_stage) {
+        const activeInLog = stageLog.some(e => e.stage === data.current_stage);
+        if (!activeInLog) {
+            html += '<div class="live-stage-detail active-stage">';
+            html += '<div class="live-stage-header">';
+            html += '<span class="stage-badge active">' + escHtml(data.current_stage) + '</span>';
+            html += '<span class="verdict running">RUNNING</span>';
+            html += '<span class="pulse-dot">&#9679;</span>';
+            html += '</div>';
+            html += '</div>';
+        }
+    }
+
+    el.innerHTML = html;
+}
+
+function toggleStageDetail(headerEl) {
+    const detail = headerEl.parentElement;
+    const output = detail.querySelector('.stage-output');
+    if (output) {
+        const isHidden = output.style.display === 'none';
+        output.style.display = isHidden ? 'block' : 'none';
+        const toggle = headerEl.querySelector('.expand-toggle');
+        if (toggle) toggle.textContent = isHidden ? '\u25B2' : '\u25BC';
+    }
+}
+
+// -- Comparison View (Phase 7c) --
+
+function renderComparisonView(stageEntry) {
+    const outputs = stageEntry.team_outputs || [];
+    if (outputs.length < 2) return '';
+
+    let html = '<div class="comparison-section">';
+    html += '<div class="comparison-toggle">';
+    html += '<button class="btn btn-sm active" onclick="showCompView(this, \'side\')">Side-by-side</button>';
+    html += '<button class="btn btn-sm" onclick="showCompView(this, \'unified\')">Unified</button>';
+    html += '</div>';
+
+    // Side-by-side view
+    html += '<div class="comparison-view side-by-side">';
+    outputs.forEach(([name, output]) => {
+        html += '<div class="diff-pane">';
+        html += '<div class="diff-pane-header">' + escHtml(name) + '</div>';
+        html += '<pre class="diff-content">' + escHtml((output || '').substring(0, 3000)) + '</pre>';
+        html += '</div>';
+    });
+    html += '</div>';
+
+    // Cross-review summaries
+    const reviews = stageEntry.cross_reviews || [];
+    if (reviews.length > 0) {
+        html += '<div class="cross-review-summary">';
+        html += '<h5>Cross-Reviews</h5>';
+        reviews.forEach(([reviewer, review]) => {
+            html += '<div class="review-entry">';
+            html += '<strong>' + escHtml(reviewer) + '</strong>';
+            html += '<pre>' + escHtml((review || '').substring(0, 1000)) + '</pre>';
+            html += '</div>';
+        });
+        html += '</div>';
+    }
+
+    // Comparison summary
+    if (stageEntry.comparison_summary) {
+        html += '<div class="comparison-summary">';
+        html += '<h5>Comparison Summary</h5>';
+        html += '<pre>' + escHtml(stageEntry.comparison_summary.substring(0, 2000)) + '</pre>';
+        html += '</div>';
+    }
+
+    html += '</div>';
+    return html;
+}
+
+function showCompView(btn, mode) {
+    const section = btn.closest('.comparison-section');
+    if (!section) return;
+    section.querySelectorAll('.comparison-toggle .btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const view = section.querySelector('.comparison-view');
+    if (view) {
+        view.className = 'comparison-view ' + (mode === 'unified' ? 'unified' : 'side-by-side');
+    }
+}
+
+function computeLineDiff(textA, textB) {
+    const linesA = (textA || '').split('\n');
+    const linesB = (textB || '').split('\n');
+    const setA = new Set(linesA);
+    const setB = new Set(linesB);
+
+    const result = { a: [], b: [] };
+    linesA.forEach(line => {
+        result.a.push({ text: line, type: setB.has(line) ? 'common' : 'removed' });
+    });
+    linesB.forEach(line => {
+        result.b.push({ text: line, type: setA.has(line) ? 'common' : 'added' });
+    });
+    return result;
 }
 
 // -- Pipeline Stats --

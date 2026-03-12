@@ -45,6 +45,24 @@ The **Program Manager** oversees the entire pipeline as a quality gatekeeper:
 
 If the PM returns REVISE, the stage is re-run with feedback (up to `PIPELINE_MAX_REVISE` attempts, default 1). CLI team members are stateless tools. Pipeline is configured in `pipeline.json`.
 
+**Safety gates:**
+- Publish is gated on `test_passed` — if tests fail, `_git_commit_and_push` is skipped
+- `_test_found_failures()` uses word-boundary matching for short keywords to reduce false positives
+- PM direct-mode failover requires 2 consecutive failures (not 1) before switching
+- `_parse_overseer_response()` defaults to REVISE (not approve) when PM response is malformed
+- Garbage detection uses tiered scoring: strong signals (2pts) vs weak signals (1pt, only if short/questioning)
+
+**Context quality:**
+- `_clean_stage_output()` strips garbage lines before appending to pipeline context
+- `_cap_context()` splits on `=== ... ===` delimiters and preserves plan sections
+- Garbage retry preserves plan context via `_extract_plan_context()` instead of passing empty context
+- Code-fix prompt is structured with `_extract_test_failures()` for targeted failure context
+
+**Agent comparison (multi-agent code stage):**
+- Cross-review uses structured format (Agreement Points, Divergences, Winner Per Component, Merge Strategy)
+- `_build_comparison_summary()` extracts structured sections for pipeline output
+- Each agent's output saved separately as `code-{agent-name}.md`
+
 **Entry points:**
 - `python task-claw.py "prompt"` — run pipeline once, exit
 - `python task-claw.py` — polling mode (monitors tasks.json / ideas.json)
@@ -140,3 +158,20 @@ Items in `tasks.json` / `ideas.json` use these fields relevant to the agent:
 - `title`, `description` — used to build prompts
 - `cli_provider` — optional per-task provider override
 - `plan` — populated after the plan stage
+
+## Testing
+
+```bash
+python -m unittest test_pipeline -v       # run all tests
+python -m unittest test_pipeline.TestIsGarbageOutput -v  # single class
+```
+
+`test_pipeline.py` uses `importlib` to import `task-claw.py` and `unittest.mock.patch.object` for mocking. Tests cover pure functions (garbage detection, failure detection, context capping, prompt building, provider commands, JSON parsing) and pipeline flow scenarios (happy path, PM failover, garbage retry, test-code loopback, publish gating, security blocking).
+
+## Claude Code Skills
+
+Skills in `.claude/skills/`:
+- **cost-estimator** — Estimate pipeline run costs based on current config
+- **skillswarm** — Orchestrate parallel pipeline runs for complex tasks
+- **agent-compare** — Compare CLI providers by running the same prompt through each
+- **provider-setup** — Guided installation and configuration of CLI providers
