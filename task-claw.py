@@ -6,7 +6,7 @@ and pushes to production.
 
 Supported CLI providers are defined in providers.json.
 """
-AGENT_VERSION = "2026.03.12-v9"  # bump this to verify we're running the right code
+AGENT_VERSION = "2026.03.13-v10"  # bump this to verify we're running the right code
 
 import json
 import mimetypes
@@ -469,7 +469,9 @@ _FALLBACK_PROMPTS: dict = {
     },
     "rewrite_format": (
         "Rewrite the following user request to be clear and actionable for a coding AI "
-        "pipeline. Structure as: WHAT, WHERE, WHY, CONSTRAINTS. "
+        "pipeline that WRITES CODE. If the request is vague or exploratory "
+        "(research/investigate/look into), convert it into a concrete coding task: "
+        "diagnose the root cause AND fix it. Structure as: WHAT, WHERE, WHY, CONSTRAINTS. "
         "Return only the rewritten prompt.\n\nOriginal request:\n{prompt}"),
 }
 
@@ -1296,6 +1298,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
     tid = task_id or f"pipeline-{int(time.time())}"
     pm_consecutive_failures = 0   # track PM failures to switch to direct mode
     test_passed = True            # Phase 1a: gate publish on test results
+    code_made_changes = False     # track if code stage actually modified files
 
     # Phase 5e: expose pipeline start time for web UI elapsed display
     with status_lock:
@@ -1335,6 +1338,14 @@ def run_pipeline(prompt: str, task_id: str | None = None,
         stage_cfg = stages_cfg.get(stage, {})
         if not stage_cfg.get("enabled", True):
             log.info("   ⏭️ Stage '%s' disabled", stage)
+            continue
+
+        # Skip verification stages if code stage made no file changes
+        if stage in ("simplify", "test") and not code_made_changes:
+            log.info("   ⏭️ Skipping '%s' — code stage made no file changes", stage)
+            stage_log.append({"stage": stage, "elapsed": 0,
+                               "verdict": "skipped", "issues": [],
+                               "team": [], "note": "No code changes to verify"})
             continue
 
         # Pipeline-level wallclock safety: abort if total time exceeds limit
@@ -1510,6 +1521,12 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                         with status_lock:
                             agent_status["stage_log"] = list(stage_log)
 
+            # After code stage, check if files actually changed
+            if stage == "code":
+                code_made_changes = _has_uncommitted_changes()
+                if not code_made_changes:
+                    log.warning("   ⚠️ Code stage produced output but no file changes detected")
+
             elapsed = time.time() - _stage_start
             log.info("   ✅ Stage '%s' done in %.0fs — DIRECT", stage, elapsed)
             stage_log.append({"stage": stage, "elapsed": round(elapsed, 1),
@@ -1612,6 +1629,12 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             # Track test results for publish gating
             if stage == "test":
                 test_passed = verdict != "revise"
+
+            # After code stage, check if files actually changed
+            if stage == "code":
+                code_made_changes = _has_uncommitted_changes()
+                if not code_made_changes:
+                    log.warning("   ⚠️ Code stage produced output but no file changes detected")
 
             # Approved (or max attempts reached) — record and move on
             stage_results[stage] = pm_result["full_response"]
@@ -2578,6 +2601,17 @@ def _git_pull() -> bool:
         return False
     except Exception as e:
         log.warning("⚠️ Git pull error: %s", e)
+        return False
+
+
+def _has_uncommitted_changes() -> bool:
+    """Check if the PROJECT_DIR working tree has any uncommitted changes."""
+    try:
+        # Check both staged and unstaged changes
+        r = subprocess.run(["git", "status", "--porcelain"],
+                           cwd=str(PROJECT_DIR), capture_output=True, text=True, timeout=10)
+        return bool(r.stdout.strip())
+    except Exception:
         return False
 
 

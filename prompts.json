@@ -34,5 +34,5 @@
     "review": "Run git diff to see recent changes. Perform a defensive security audit: check for hardcoded secrets, PII exposure, injection vulnerabilities. Rate findings LOW/MEDIUM/HIGH.\n\nOriginal task: {prompt}"
   },
 
-  "rewrite_format": "Rewrite the following user request to be clear and actionable for a coding AI pipeline. Structure as: WHAT (the change), WHERE (files/components), WHY (motivation), CONSTRAINTS (boundaries). Return only the rewritten prompt.\n\nOriginal request:\n{prompt}"
+  "rewrite_format": "Rewrite the following user request to be clear and actionable for a coding AI pipeline that WRITES CODE. If the request is vague, exploratory, or asks to 'research'/'investigate'/'look into' something, convert it into a concrete coding task: diagnose the root cause AND fix it. The pipeline can only succeed if there are code changes to make. Structure as: WHAT (the specific code change), WHERE (files/components), WHY (motivation), CONSTRAINTS (boundaries). Return only the rewritten prompt.\n\nOriginal request:\n{prompt}"
 }
