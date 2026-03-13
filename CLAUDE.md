@@ -52,6 +52,13 @@ If the PM returns REVISE, the stage is re-run with feedback (up to `PIPELINE_MAX
 - `_parse_overseer_response()` defaults to REVISE (not approve) when PM response is malformed
 - Garbage detection uses tiered scoring: strong signals (2pts) vs weak signals (1pt, only if short/questioning)
 
+**Prompt system (`prompts.json`):**
+- All PM and CLI prompt templates are externalized in `prompts.json` — editable without code changes
+- PM prompts (API calls) can be detailed; CLI prompts MUST stay short (<500 chars of instructions)
+- `_warn_cli_prompt_size()` logs a warning if CLI instruction chars exceed the safe threshold
+- `_load_prompts()` caches the file; inline fallbacks keep the agent running if the file is missing
+- Prompt patterns drawn from Kiro, Cursor, Codex CLI, Devin, Claude Code, and Antigravity
+
 **Context quality:**
 - `_clean_stage_output()` strips garbage lines before appending to pipeline context
 - `_cap_context()` splits on `=== ... ===` delimiters and preserves plan sections
@@ -59,7 +66,7 @@ If the PM returns REVISE, the stage is re-run with feedback (up to `PIPELINE_MAX
 - Code-fix prompt is structured with `_extract_test_failures()` for targeted failure context
 
 **Agent comparison (multi-agent code stage):**
-- Cross-review uses structured format (Agreement Points, Divergences, Winner Per Component, Merge Strategy)
+- Cross-review uses structured format (Agreement Points, Divergences, Winner Per Component, Merge Strategy, Issues Found)
 - `_build_comparison_summary()` extracts structured sections for pipeline output
 - Each agent's output saved separately as `code-{agent-name}.md`
 
