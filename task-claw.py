@@ -177,15 +177,23 @@ def _get_stage_stats(stage_name: str) -> dict:
 
 PROVIDERS_FILE = AGENT_DIR / "providers.json"
 
+
+def _load_json_file(path: Path, default: dict, label: str = "") -> dict:
+    """Load a JSON config file. Returns *default* if absent or unreadable."""
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logging.warning("Could not load %s: %s", label or path.name, e)
+        return default
+
+
 def _load_providers() -> dict:
     """Load provider definitions from providers.json."""
-    if not PROVIDERS_FILE.exists():
-        return {"providers": {}, "default_provider": "claude"}
-    try:
-        return json.loads(PROVIDERS_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        logging.warning("Could not load providers.json: %s", e)
-        return {"providers": {}, "default_provider": "claude"}
+    return _load_json_file(PROVIDERS_FILE,
+                           {"providers": {}, "default_provider": "claude"},
+                           "providers.json")
 
 
 def _get_provider(name: str | None = None) -> dict:
@@ -351,13 +359,7 @@ _PIPELINE_DEFAULT: dict = {
 def load_pipeline() -> dict:
     """Load pipeline.json; returns built-in default if absent or unreadable."""
     pipeline_file = Path(os.environ.get("PIPELINE_FILE", str(AGENT_DIR / "pipeline.json")))
-    if not pipeline_file.exists():
-        return _PIPELINE_DEFAULT
-    try:
-        return json.loads(pipeline_file.read_text(encoding="utf-8"))
-    except Exception as e:
-        logging.warning("Could not load pipeline.json: %s — using defaults", e)
-        return _PIPELINE_DEFAULT
+    return _load_json_file(pipeline_file, _PIPELINE_DEFAULT, "pipeline.json")
 
 
 def _clean_env() -> dict:
@@ -370,33 +372,98 @@ def _clean_env() -> dict:
 
 
 # ── Externalized prompt templates ────────────────────────────────────────────
-# Loaded from prompts.json if available; inline fallbacks keep the agent
-# functional even when the file is missing.  CLI prompts MUST stay short
+# Loaded from prompts.json at startup; inline fallbacks keep the agent
+# functional when the file is missing.  CLI prompts MUST stay short
 # (<500 chars of instructions) to avoid triggering permission prompts.
 
-_PROMPTS: dict = {}
 _CLI_PROMPT_WARN_CHARS = 500  # instruction-only threshold for CLI prompts
+
+# Single source of truth for fallback strings (used when prompts.json is absent).
+# These match the values in prompts.json — edit ONE place, not both.
+_FALLBACK_PROMPTS: dict = {
+    "pm_system": {
+        "director": (
+            "You are a senior Program Manager directing an AI coding team through a "
+            "multi-stage pipeline (plan → code → simplify → test → review → publish). "
+            "You write precise, actionable task briefs."),
+        "overseer": (
+            "You are a senior Program Manager overseeing an AI coding pipeline. "
+            "Prioritize technical accuracy — disagree when output is wrong. "
+            "You MUST NOT approve work that is incomplete, incorrect, or has drifted."),
+        "merger": (
+            "You are a senior PM overseeing an AI coding pipeline. "
+            "Produce a merged result from multiple implementations + cross-reviews. "
+            "Fix ALL identified issues. Do NOT approve code with known bugs."),
+        "rewriter": "You are a senior PM preparing a user request for an AI coding pipeline.",
+        "cross_reviewer": (
+            "You are a senior code reviewer. Prioritize technical accuracy. "
+            "Disagree when code is wrong."),
+    },
+    "cli_prompts": {
+        "plan": (
+            "I need to understand the codebase before making changes.\n\n"
+            "Task context: {prompt}\n\n"
+            "Output a step-by-step implementation plan with:\n"
+            "- Actionable verb-led steps with specific files\n"
+            "- Incremental build order\n"
+            "- Testing strategy"),
+        "code_suffix": (
+            "\n\nFollow existing conventions. Use descriptive names. "
+            "Fix root causes. Keep changes minimal."),
+        "simplify": (
+            "Run git diff to see recent changes. Review for quality, then fix "
+            "issues found: duplicate logic, bad naming, empty catch blocks, dead "
+            "code, deep nesting. Cap fix iterations at 3 per file.\n\n"
+            "Original task: {prompt}"),
+        "test": (
+            "Run git diff to see recent changes, then verify they work correctly. "
+            "If tests fail, fix the code not the tests. Report specific pass/fail "
+            "results.\n\nOriginal task: {prompt}"),
+        "review": (
+            "Run git diff to see recent changes. Perform a defensive security "
+            "audit: check for hardcoded secrets, PII exposure, injection "
+            "vulnerabilities. Rate findings LOW/MEDIUM/HIGH.\n\n"
+            "Original task: {prompt}"),
+    },
+    "rewrite_format": (
+        "Rewrite the following user request to be clear and actionable for a coding AI "
+        "pipeline. Structure as: WHAT, WHERE, WHY, CONSTRAINTS. "
+        "Return only the rewritten prompt.\n\nOriginal request:\n{prompt}"),
+}
+
+# Loaded once at init (before threads spawn); None = not yet loaded.
+_PROMPTS: dict | None = None
 
 
 def _load_prompts() -> dict:
-    """Load prompts.json once; return cached dict (empty dict = no file)."""
+    """Load prompts.json once at first call; return cached dict thereafter."""
     global _PROMPTS
-    if _PROMPTS:
+    if _PROMPTS is not None:
         return _PROMPTS
     pf = Path(os.environ.get("PROMPTS_FILE", str(AGENT_DIR / "prompts.json")))
-    if pf.exists():
-        try:
-            _PROMPTS = json.loads(pf.read_text(encoding="utf-8"))
-            log.info("Loaded %d prompt sections from %s", len(_PROMPTS), pf)
-        except Exception as e:
-            log.warning("Could not load prompts.json: %s — using inline defaults", e)
+    _PROMPTS = _load_json_file(pf, {}, "prompts.json")
+    if _PROMPTS:
+        log.info("Loaded %d prompt sections from %s", len(_PROMPTS), pf)
     return _PROMPTS
 
 
-def _get_prompt(section: str, key: str, fallback: str = "") -> str:
-    """Get a prompt template from prompts.json or return fallback."""
+def _get_prompt(section: str, key: str | None = None, fallback: str = "") -> str:
+    """Get a prompt template from prompts.json or _FALLBACK_PROMPTS.
+
+    When *key* is None, looks up a top-level key (e.g. "rewrite_format").
+    When *key* is given, looks up section[key] (e.g. "pm_system"/"director").
+    Falls back to _FALLBACK_PROMPTS, then to *fallback*.
+    """
     prompts = _load_prompts()
-    return prompts.get(section, {}).get(key, fallback)
+    if key is None:
+        result = prompts.get(section)
+        if result is not None:
+            return result
+        return _FALLBACK_PROMPTS.get(section, fallback)
+    result = prompts.get(section, {}).get(key)
+    if result is not None:
+        return result
+    return _FALLBACK_PROMPTS.get(section, {}).get(key, fallback)
 
 
 def _warn_cli_prompt_size(stage: str, prompt: str, dynamic_len: int = 0):
@@ -545,12 +612,8 @@ def pm_direct_team(stage_name: str, original_prompt: str, context: str,
 
     Returns (brief, pm_succeeded).
     """
-    system_msg = _get_prompt("pm_system", "director",
-        "You are a senior Program Manager directing an AI coding team through a "
-        "multi-stage pipeline (plan → code → simplify → test → review → publish). "
-        "You write precise, actionable task briefs."
-    )
-    guidance = _get_prompt("pm_stage_guidance", stage_name, "")
+    system_msg = _get_prompt("pm_system", "director")
+    guidance = _get_prompt("pm_stage_guidance", stage_name)
     user_msg = (
         f"Stage: {stage_name}\n"
         f"Team members: {', '.join(team)}\n"
@@ -637,12 +700,8 @@ def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
     agent_blocks = "\n\n".join(
         f"--- Agent: {name} ---\n{output}" for name, output in team_outputs
     )
-    system_msg = _get_prompt("pm_system", "overseer",
-        "You are a senior Program Manager overseeing an AI coding pipeline. "
-        "Prioritize technical accuracy — disagree when output is wrong. "
-        "You MUST NOT approve work that is incomplete, incorrect, or has drifted."
-    )
-    criteria = _get_prompt("pm_stage_criteria", stage_name, "")
+    system_msg = _get_prompt("pm_system", "overseer")
+    criteria = _get_prompt("pm_stage_criteria", stage_name)
     user_msg = (
         f"Stage: {stage_name}\n"
         f"Original user request: {original_prompt}\n\n"
@@ -788,9 +847,7 @@ def cross_review_code(team_outputs: list, plan_context: str,
             f"--- Implementation by {name} ---\n{code}" for name, code in others
         )
 
-        cr_system = _get_prompt("pm_system", "cross_reviewer",
-            "You are a senior code reviewer. Prioritize technical accuracy. "
-            "Disagree when code is wrong.")
+        cr_system = _get_prompt("pm_system", "cross_reviewer")
         review_prompt = (
             f"{cr_system}\n\n"
             f"Original request: {original_prompt}\n\n"
@@ -865,11 +922,7 @@ def pm_merge_with_reviews(stage_name: str, original_prompt: str, context: str,
         for name, output in cross_reviews
     )
 
-    system_msg = _get_prompt("pm_system", "merger",
-        "You are a senior PM overseeing an AI coding pipeline. "
-        "Produce a merged result from multiple implementations + cross-reviews. "
-        "Fix ALL identified issues. Do NOT approve code with known bugs."
-    )
+    system_msg = _get_prompt("pm_system", "merger")
     user_msg = (
         f"Stage: {stage_name}\n"
         f"Original user request: {original_prompt}\n\n"
@@ -973,13 +1026,8 @@ def run_team(stage_name: str, prompt: str, team_provider_names: list,
 
 def rewrite_prompt(raw_prompt: str, pm_cfg: dict) -> str:
     """Have the PM rewrite the raw prompt for clarity. Falls back to original on failure."""
-    system_msg = _get_prompt("pm_system", "rewriter",
-        "You are a senior PM preparing a user request for an AI coding pipeline.")
-    rewrite_fallback = (
-        "Rewrite the following user request to be clear and actionable for a coding AI "
-        "pipeline. Structure as: WHAT, WHERE, WHY, CONSTRAINTS. "
-        "Return only the rewritten prompt.\n\nOriginal request:\n{prompt}")
-    rewrite_fmt = _load_prompts().get("rewrite_format", rewrite_fallback) or rewrite_fallback
+    system_msg = _get_prompt("pm_system", "rewriter")
+    rewrite_fmt = _get_prompt("rewrite_format")
     user_msg = rewrite_fmt.replace("{prompt}", raw_prompt)
     log.info("   PM [rewrite]: clarifying prompt (%d chars)…", len(raw_prompt))
     try:
@@ -1054,17 +1102,9 @@ def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
     CLI prompts are loaded from prompts.json["cli_prompts"] with inline fallbacks.
     A size guard warns if instruction chars exceed _CLI_PROMPT_WARN_CHARS.
     """
-    cli = _load_prompts().get("cli_prompts", {})
-
     # For plan stage — analyze codebase, output a plan.
     if stage == "plan":
-        tmpl = cli.get("plan",
-            "I need to understand the codebase before making changes.\n\n"
-            "Task context: {prompt}\n\n"
-            "Output a step-by-step implementation plan with:\n"
-            "- Actionable verb-led steps with specific files\n"
-            "- Incremental build order\n"
-            "- Testing strategy")
+        tmpl = _get_prompt("cli_prompts", "plan")
         result = tmpl.replace("{prompt}", original_prompt)
         _warn_cli_prompt_size(stage, result, len(original_prompt))
         return result
@@ -1079,32 +1119,14 @@ def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
             clean = '\n'.join(lines).strip()
             if clean and len(clean) > 50:
                 prompt += f"\n\nPlan:\n{clean[-3000:]}"
-        suffix = cli.get("code_suffix",
-            "\n\nFollow existing conventions. Use descriptive names. "
-            "Fix root causes. Keep changes minimal.")
+        suffix = _get_prompt("cli_prompts", "code_suffix")
         result = prompt + suffix
         _warn_cli_prompt_size(stage, result, len(prompt))
         return result
 
-    # For simplify, test, review — load from prompts.json with fallbacks
-    _fallbacks = {
-        "simplify": (
-            "Run git diff to see recent changes. Review for quality, then fix "
-            "issues found: duplicate logic, bad naming, empty catch blocks, dead "
-            "code, deep nesting. Cap fix iterations at 3 per file.\n\n"
-            "Original task: {prompt}"),
-        "test": (
-            "Run git diff to see recent changes, then verify they work correctly. "
-            "If tests fail, fix the code not the tests. Report specific pass/fail "
-            "results.\n\nOriginal task: {prompt}"),
-        "review": (
-            "Run git diff to see recent changes. Perform a defensive security "
-            "audit: check for hardcoded secrets, PII exposure, injection "
-            "vulnerabilities. Rate findings LOW/MEDIUM/HIGH.\n\n"
-            "Original task: {prompt}"),
-    }
-    if stage in _fallbacks:
-        tmpl = cli.get(stage, _fallbacks[stage])
+    # For simplify, test, review — unified lookup through _get_prompt
+    if stage in ("simplify", "test", "review"):
+        tmpl = _get_prompt("cli_prompts", stage)
         result = tmpl.replace("{prompt}", original_prompt)
         _warn_cli_prompt_size(stage, result, len(original_prompt))
         return result
