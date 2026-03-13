@@ -187,7 +187,7 @@ class TestBuildDirectPrompt(unittest.TestCase):
 
     def test_plan_stage(self):
         result = tc._build_direct_prompt("plan", "Add logging", "")
-        self.assertIn("step-by-step plan", result)
+        self.assertIn("step-by-step implementation plan", result)
 
     def test_code_stage_with_context(self):
         # Context must be >50 chars after cleaning to be appended

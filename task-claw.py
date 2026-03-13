@@ -6,7 +6,7 @@ and pushes to production.
 
 Supported CLI providers are defined in providers.json.
 """
-AGENT_VERSION = "2026.03.11-v7"  # bump this to verify we're running the right code
+AGENT_VERSION = "2026.03.12-v8"  # bump this to verify we're running the right code
 
 import json
 import mimetypes
@@ -506,15 +506,80 @@ def pm_direct_team(stage_name: str, original_prompt: str, context: str,
 
     Returns (brief, pm_succeeded).
     """
-    system_msg = "You are a Program Manager directing an AI coding team."
+    system_msg = (
+        "You are a senior Program Manager directing an AI coding team through a "
+        "multi-stage pipeline (plan → code → simplify → test → review → publish). "
+        "You write precise, actionable task briefs. You think before acting: "
+        "consider what the team needs to succeed at THIS stage given all prior context."
+    )
+    # Stage-specific PM guidance (inspired by Kiro spec, Antigravity, Codex CLI)
+    stage_guidance = {
+        "plan": (
+            "PLANNING MODE: Write a task brief that produces an implementation plan.\n"
+            "The plan must contain:\n"
+            "- Actionable verb-led steps (5-7 words each, e.g. 'Add retry logic to API client')\n"
+            "- Specific files/components to create or modify\n"
+            "- Data model changes if any\n"
+            "- Error handling strategy\n"
+            "- Testing strategy (what to test and how)\n"
+            "Reject vague plans like 'Create CLI tool / Add parser / Convert output'.\n"
+            "Good plans look like: 'Add CLI entry with file args / Parse Markdown via CommonMark / "
+            "Apply semantic HTML template / Handle code blocks and images / Add error handling'.\n"
+            "Ensure steps build incrementally — no big jumps in complexity, no orphaned code."
+        ),
+        "code": (
+            "EXECUTION MODE: Write a task brief for code implementation.\n"
+            "Instruct the team to:\n"
+            "- Follow existing codebase conventions (check imports, naming, patterns before writing)\n"
+            "- Use full descriptive names (no 1-2 char variables)\n"
+            "- Use guard clauses and early returns; avoid nesting beyond 2-3 levels\n"
+            "- Fix root causes, not symptoms — no surface-level patches\n"
+            "- Keep changes minimal and focused on the task\n"
+            "- Never assume a library is available — check existing imports first\n"
+            "- Comments explain 'why' not 'how'; skip comments for obvious code\n"
+            "Reference the plan from prior context. Be surgical."
+        ),
+        "simplify": (
+            "VERIFICATION MODE: Write a task brief for code quality review.\n"
+            "Instruct the team to:\n"
+            "- Review git diff for reuse opportunities, quality issues, and efficiency\n"
+            "- Check naming (descriptive verbs for functions, nouns for variables)\n"
+            "- Verify error handling is meaningful (no empty catch blocks)\n"
+            "- Ensure no dead code, unused imports, or premature abstractions\n"
+            "- Cap fix iterations at 3 per file — don't loop endlessly on linter issues\n"
+            "- Validate changes compile/run after each fix"
+        ),
+        "test": (
+            "VERIFICATION MODE: Write a task brief for testing.\n"
+            "Instruct the team to:\n"
+            "- Start with tests specific to the changed code, then broaden\n"
+            "- Detect the test framework from the codebase — never assume\n"
+            "- When tests fail, fix the CODE first, not the tests\n"
+            "- Never modify existing tests unless the task explicitly requires it\n"
+            "- Validate test files compile before running them\n"
+            "- Report specific pass/fail results with error details"
+        ),
+        "review": (
+            "VERIFICATION MODE: Write a task brief for security and quality audit.\n"
+            "Instruct the team to:\n"
+            "- Perform a defensive security analysis (not offensive)\n"
+            "- Check for: hardcoded secrets, PII exposure, unvalidated inputs, "
+            "injection vulnerabilities (SQL, XSS, CSRF, command injection)\n"
+            "- Verify no secrets or credentials in git diff\n"
+            "- Assess severity: LOW (style/minor) / MEDIUM (logic/perf) / HIGH (security/data loss)\n"
+            "- HIGH severity blocks publish — be precise about what qualifies"
+        ),
+    }
+    guidance = stage_guidance.get(stage_name, "")
     user_msg = (
         f"Stage: {stage_name}\n"
         f"Team members: {', '.join(team)}\n"
         f"Original user request: {original_prompt}\n\n"
         f"Prior pipeline context:\n{context}\n\n"
-        "Write a clear, specific task brief for the team to execute in this stage. "
-        "Include: what to do, what files/components to focus on, any constraints from prior stages, "
-        "and the expected output format. Be concise and actionable. "
+        f"{guidance}\n\n"
+        "Write a clear, specific task brief for the team. "
+        "Include: what to do, which files/components to focus on, constraints from prior stages, "
+        "and expected output format. Be concise and actionable. "
         "Return only the task brief — no preamble."
     )
     log.info("   PM [direct/%s]: generating task brief for team %s…", stage_name, team)
@@ -593,25 +658,70 @@ def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
         f"--- Agent: {name} ---\n{output}" for name, output in team_outputs
     )
     system_msg = (
-        "You are a Program Manager overseeing an AI coding pipeline. "
-        "Your job is NOT to simply pick a winner — you oversee quality, verify "
-        "that stage outputs meet requirements, identify gaps or drift from the "
-        "original request, and decide whether the stage passes your quality gate."
+        "You are a senior Program Manager overseeing an AI coding pipeline. "
+        "Prioritize technical accuracy over validation — disagree when output is wrong. "
+        "Your job is NOT to rubber-stamp or pick a winner. You verify stage outputs meet "
+        "requirements, identify gaps or drift, and enforce the quality gate. "
+        "You MUST NOT approve work that is incomplete, incorrect, or has drifted from the plan."
     )
+    # Stage-specific quality criteria for the PM to check
+    stage_criteria = {
+        "plan": (
+            "Plan-specific criteria:\n"
+            "- Steps must be actionable and verb-led (5-7 words each)\n"
+            "- Steps must build incrementally — no orphaned code between steps\n"
+            "- Must include specific files/components, not vague references\n"
+            "- Must include testing strategy\n"
+            "- Reject plans that are just 'Create X / Add Y / Convert Z' with no specifics"
+        ),
+        "code": (
+            "Code-specific criteria:\n"
+            "- Follows existing codebase conventions (naming, imports, patterns)\n"
+            "- Uses descriptive names (no 1-2 char variables)\n"
+            "- Guard clauses / early returns used; nesting ≤ 3 levels\n"
+            "- Root cause fixed, not surface-patched\n"
+            "- No unused imports, dead code, or premature abstractions\n"
+            "- Changes are minimal and focused on the task"
+        ),
+        "simplify": (
+            "Simplify-specific criteria:\n"
+            "- Code review found and fixed real issues (not just cosmetic changes)\n"
+            "- No new issues introduced by the fixes\n"
+            "- Changes compile/run correctly"
+        ),
+        "test": (
+            "Test-specific criteria:\n"
+            "- Tests cover the specific changes made, not just generic tests\n"
+            "- Existing tests were NOT modified unless task required it\n"
+            "- Clear pass/fail report with specific error details for failures\n"
+            "- If failures found, root cause identified in code (not test)"
+        ),
+        "review": (
+            "Review-specific criteria:\n"
+            "- Security analysis is defensive and thorough\n"
+            "- Checked for: hardcoded secrets, PII, injection (SQL/XSS/CSRF/command), "
+            "unvalidated inputs\n"
+            "- Severity ratings are justified (HIGH = security/data loss)\n"
+            "- No false positives inflating severity"
+        ),
+    }
+    criteria = stage_criteria.get(stage_name, "")
     user_msg = (
         f"Stage: {stage_name}\n"
         f"Original user request: {original_prompt}\n\n"
         f"Prior pipeline context:\n{context}\n\n"
         f"The following agents worked on this stage simultaneously:\n\n"
         f"{agent_blocks}\n\n"
-        "As the PM overseeing this pipeline, evaluate the stage output(s):\n\n"
+        f"{criteria}\n\n"
+        "Evaluate the stage output(s) rigorously:\n\n"
         "1. **Requirements check**: Does the output fully address the original request? "
         "List any missed requirements or gaps.\n"
         "2. **Quality check**: Is the output correct, complete, and production-ready? "
         "Flag any issues, bugs, or incomplete work.\n"
         "3. **Drift check**: Has the implementation drifted from the plan or prior stage context? "
         "Note any deviations.\n"
-        "4. **Verdict**: APPROVE if the output meets quality standards, or REVISE if it needs rework.\n\n"
+        "4. **Verdict**: APPROVE only if output meets ALL quality standards. REVISE if anything is "
+        "incomplete, incorrect, or has drifted. When in doubt, REVISE.\n\n"
         "Return your response in these sections:\n"
         "## Verdict\nAPPROVE or REVISE\n\n"
         "## Issues\n[bullet list of any problems found, or 'None']\n\n"
@@ -749,20 +859,30 @@ def cross_review_code(team_outputs: list, plan_context: str,
         )
 
         review_prompt = (
-            f"You are reviewing code produced by other agents.\n\n"
+            f"You are a senior code reviewer with professional objectivity. "
+            "Prioritize technical accuracy over politeness — disagree when code is wrong. "
+            "Focus on facts and problem-solving. No unnecessary praise or emotional validation.\n\n"
             f"Original request: {original_prompt}\n\n"
             f"Plan context:\n{plan_context}\n\n"
             f"Implementations to review:\n\n{other_blocks}\n\n"
-            "Perform a structured comparison review. Return your response in these sections:\n\n"
+            "Perform a rigorous structured review. For each implementation check:\n"
+            "- Follows existing codebase conventions (naming, imports, patterns)\n"
+            "- Uses descriptive names; no 1-2 char variables\n"
+            "- Guard clauses / early returns; nesting ≤ 3 levels\n"
+            "- Root cause addressed, not surface-patched\n"
+            "- No security issues (hardcoded secrets, injection, unvalidated input)\n"
+            "- Changes are minimal and focused\n\n"
+            "Return your response in these sections:\n\n"
             "## Agreement Points\n"
-            "[What both implementations do the same way]\n\n"
+            "[What implementations do the same way]\n\n"
             "## Divergences\n"
-            "[Specific differences, with file:line references]\n\n"
+            "[Specific differences with file:line references]\n\n"
+            "## Issues Found\n"
+            "[Bugs, security concerns, convention violations — be specific]\n\n"
             "## Winner Per Component\n"
-            "[For each feature/component, which implementation is better and why]\n\n"
+            "[For each feature/component, which is better and why]\n\n"
             "## Recommended Merge Strategy\n"
-            "[How to combine the best of both]\n\n"
-            "Be specific and actionable. Reference file names and line numbers where possible."
+            "[How to combine the best of both, addressing all issues found]"
         )
         try:
             provider = get_provider_for_phase("review", reviewer_name)
@@ -827,10 +947,12 @@ def pm_merge_with_reviews(stage_name: str, original_prompt: str, context: str,
     )
 
     system_msg = (
-        "You are a Program Manager overseeing an AI coding pipeline. "
+        "You are a senior Program Manager overseeing an AI coding pipeline. "
+        "Prioritize technical accuracy — disagree with agents when they are wrong. "
         "Multiple agents have produced implementations AND reviewed each other's work. "
-        "Your job is to deeply analyze both implementations, leverage the cross-reviews, "
-        "and produce a merged result that takes the best elements from each."
+        "Your job is to deeply analyze both, leverage the cross-reviews and issues found, "
+        "and produce a merged result that takes the best elements while fixing ALL identified issues. "
+        "Do NOT approve code with known bugs, security issues, or convention violations."
     )
     user_msg = (
         f"Stage: {stage_name}\n"
@@ -935,10 +1057,15 @@ def run_team(stage_name: str, prompt: str, team_provider_names: list,
 
 def rewrite_prompt(raw_prompt: str, pm_cfg: dict) -> str:
     """Have the PM rewrite the raw prompt for clarity. Falls back to original on failure."""
-    system_msg = "You are a Program Manager preparing a user request for an AI coding pipeline."
+    system_msg = "You are a senior Program Manager preparing a user request for an AI coding pipeline."
     user_msg = (
         "Rewrite the following user request to be maximally clear, specific, and actionable "
-        "for a coding AI pipeline. Preserve all intent. "
+        "for a coding AI pipeline. Preserve all intent.\n\n"
+        "Structure the rewrite as:\n"
+        "- WHAT: the specific change or feature\n"
+        "- WHERE: which files/components/areas are affected\n"
+        "- WHY: the motivation (if discernible from the request)\n"
+        "- CONSTRAINTS: any boundaries or requirements mentioned\n\n"
         "Return only the rewritten prompt — no explanation, no preamble.\n\n"
         f"Original request:\n{raw_prompt}"
     )
@@ -1011,39 +1138,90 @@ def _build_direct_prompt(stage: str, original_prompt: str, context: str) -> str:
     """
     Build a clean prompt for a CLI agent. Keep it SHORT — verbose meta-instructions
     cause Claude Code to get confused about permissions and ask questions instead of acting.
+
+    Prompt patterns drawn from Kiro, Cursor, Codex CLI, Devin, and Claude Code internals.
     """
     # For plan stage — analyze codebase, output a plan.
     # Claude tries to edit if the prompt contains action words, so we rephrase
     # the task as an analysis question. permission-mode=plan blocks writes as safety net.
     if stage == "plan":
-        return (f"I need to understand the codebase before making changes.\n\n"
-                f"Task context: {original_prompt}\n\n"
-                "Which files are involved? What does each relevant file do? "
-                "What is the step-by-step plan to accomplish this task?")
+        return (
+            f"I need to understand the codebase before making changes.\n\n"
+            f"Task context: {original_prompt}\n\n"
+            "Which files are involved? What does each relevant file do?\n\n"
+            "Output a step-by-step implementation plan with:\n"
+            "- Actionable verb-led steps (e.g. 'Add retry logic to API client')\n"
+            "- Specific files/components to create or modify for each step\n"
+            "- Steps that build incrementally — no big complexity jumps, no orphaned code\n"
+            "- Testing strategy (what to test and how)\n"
+            "- Error handling approach"
+        )
 
-    # For code stage, just give the task (Claude knows how to code)
+    # For code stage — task + conventions guidance (Claude knows how to code)
     if stage == "code":
         prompt = original_prompt
         # Include plan context if available (only non-garbage parts)
         if context:
             clean = re.sub(r'## [A-Z]+ HANDOFF\n(?:## \w+\n)?', '', context)
-            # Strip out any prior garbage like permission messages
             lines = [l for l in clean.strip().split('\n')
                      if not any(p in l.lower() for p in _GARBAGE_PATTERNS)]
             clean = '\n'.join(lines).strip()
             if clean and len(clean) > 50:
                 prompt += f"\n\nPlan:\n{clean[-3000:]}"
+        prompt += (
+            "\n\nCode conventions:\n"
+            "- Check existing imports and patterns before writing new code\n"
+            "- Use descriptive names (no 1-2 char variables); functions=verbs, variables=nouns\n"
+            "- Guard clauses / early returns; keep nesting ≤ 3 levels\n"
+            "- Fix root causes, not symptoms\n"
+            "- Keep changes minimal and focused"
+        )
         return prompt
 
-    # For simplify stage, review changed code for reuse, quality, and efficiency
+    # For simplify stage — structured quality review with iteration cap
     if stage == "simplify":
-        return ("Run git diff to see the recent changes. "
-                "Review the changed code for reuse, quality, and efficiency, then fix any issues found.\n\n"
-                f"Original task: {original_prompt}")
+        return (
+            "Run git diff to see the recent changes. "
+            "Review the changed code for quality, then fix issues found.\n\n"
+            "Check for:\n"
+            "- Reuse opportunities (duplicate logic that should be a shared function)\n"
+            "- Naming quality (descriptive verbs for functions, nouns for variables)\n"
+            "- Empty catch blocks or meaningless error handling\n"
+            "- Dead code, unused imports, premature abstractions\n"
+            "- Nesting beyond 3 levels\n\n"
+            "Fix real issues only. Do not loop more than 3 times on linter fixes per file.\n"
+            "Validate changes compile/run after each fix.\n\n"
+            f"Original task: {original_prompt}"
+        )
 
-    # For test stage, check the diff
+    # For test stage — graduated testing, don't modify existing tests
     if stage == "test":
-        return f"Run git diff to see recent changes, then verify they work correctly. Report results.\n\nOriginal task: {original_prompt}"
+        return (
+            "Run git diff to see recent changes, then verify they work correctly.\n\n"
+            "Testing approach:\n"
+            "- Start with tests specific to the changed code, then broaden if needed\n"
+            "- Detect the test framework from the codebase — do not assume\n"
+            "- If tests fail: fix the CODE, not the tests (unless the task requires test changes)\n"
+            "- Never modify existing tests unless explicitly required\n"
+            "- Validate test files compile before running them\n\n"
+            "Report specific pass/fail results with error details.\n\n"
+            f"Original task: {original_prompt}"
+        )
+
+    # For review stage — defensive security analysis
+    if stage == "review":
+        return (
+            "Run git diff to see recent changes, then perform a defensive security audit.\n\n"
+            "Check for:\n"
+            "- Hardcoded secrets, API keys, or credentials\n"
+            "- PII exposure in logs, errors, or responses\n"
+            "- Injection vulnerabilities (SQL, XSS, CSRF, command injection)\n"
+            "- Unvalidated user inputs at system boundaries\n"
+            "- Secrets or credentials in the git diff that would be committed\n\n"
+            "Rate each finding: LOW (style) / MEDIUM (logic/perf) / HIGH (security/data loss).\n"
+            "HIGH severity must be precise and justified — it blocks publish.\n\n"
+            f"Original task: {original_prompt}"
+        )
 
     # Fallback
     return original_prompt
