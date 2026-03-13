@@ -6,7 +6,7 @@ and pushes to production.
 
 Supported CLI providers are defined in providers.json.
 """
-AGENT_VERSION = "2026.03.12-v8"  # bump this to verify we're running the right code
+AGENT_VERSION = "2026.03.12-v9"  # bump this to verify we're running the right code
 
 import json
 import mimetypes
@@ -242,12 +242,19 @@ def _write_prompt_file(prompt: str, task_id: str, stage: str, phase: str) -> Pat
     return prompt_file
 
 
+_PROMPT_FILE_THRESHOLD = 6000  # chars — auto-switch to file-based prompt above this
+
+
 def build_cli_command(provider: dict, phase: str, prompt: str,
                       prompt_file: Path | None = None) -> list[str]:
     """
     Build the full CLI command list from a provider config.
     Replaces {prompt} placeholder in args with the actual prompt text,
     and {prompt_file} with the path to a file containing the prompt.
+
+    When a prompt_file is provided and the prompt exceeds _PROMPT_FILE_THRESHOLD
+    chars, automatically substitutes "-p {prompt}" with file-based input to avoid
+    OS command-line length limits (Windows: 8191 for cmd.exe, 32K for CreateProcess).
     """
     binary = provider["binary"]
     # Resolve .cmd/.bat/.exe on Windows so subprocess can find it
@@ -272,8 +279,43 @@ def build_cli_command(provider: dict, phase: str, prompt: str,
         arg_key = "implement_args"
 
     args = list(provider.get(arg_key, ["-p", "{prompt}"]))
-    pf_str = str(prompt_file) if prompt_file else ""
-    args = [a.replace("{prompt_file}", pf_str).replace("{prompt}", prompt) for a in args]
+
+    # Auto-switch: when prompt is long and a file exists, replace inline "-p {prompt}"
+    # with file-based input to avoid command-line truncation on Windows.
+    use_file = (prompt_file and len(prompt) > _PROMPT_FILE_THRESHOLD)
+    if use_file:
+        bin_name = Path(binary).stem.lower()
+        new_args = []
+        i = 0
+        swapped = False
+        while i < len(args):
+            if args[i] in ("-p", "--prompt", "--message") and i + 1 < len(args) and "{prompt}" in args[i + 1]:
+                # Replace with file-based flag for known CLIs
+                if bin_name == "claude":
+                    new_args.extend(["--prompt-file", str(prompt_file)])
+                elif bin_name == "aider":
+                    new_args.extend(["--message-file", str(prompt_file)])
+                else:
+                    # Generic fallback: read file content into the arg
+                    new_args.extend([args[i], prompt])
+                    i += 2
+                    continue
+                swapped = True
+                i += 2
+                continue
+            new_args.append(args[i].replace("{prompt_file}", str(prompt_file)).replace("{prompt}", prompt))
+            i += 1
+        if swapped:
+            log.info("   Auto-switched to prompt file (%d chars > %d threshold): %s",
+                     len(prompt), _PROMPT_FILE_THRESHOLD, prompt_file)
+            args = new_args
+        else:
+            # No "-p {prompt}" found to swap; fall through to normal substitution
+            pf_str = str(prompt_file) if prompt_file else ""
+            args = [a.replace("{prompt_file}", pf_str).replace("{prompt}", prompt) for a in args]
+    else:
+        pf_str = str(prompt_file) if prompt_file else ""
+        args = [a.replace("{prompt_file}", pf_str).replace("{prompt}", prompt) for a in args]
 
     return [binary] + sub + args
 
@@ -643,7 +685,11 @@ _GARBAGE_STRONG = [
     "please describe", "please provide", "please share",
     "please approve", "i don't see", "i don't have",
     "what bug are you", "message might be incomplete",
-    "message got cut off", "plan handoff", "no plan content",
+    "message got cut off", "message may have been cut off",
+    "message was cut off", "message appears to be cut off",
+    "got cut off", "was cut off", "appears incomplete",
+    "no content after it", "but no content", "but no details",
+    "plan handoff", "no plan content",
     "what do you want", "how can i help", "can you clarify",
     "what specific", "what exactly", "can you tell me",
     "need more context", "i'd be happy to help", "i'll need to know",
@@ -1065,6 +1111,7 @@ def _cap_context(context: str, max_chars: int = 12000) -> str:
 
 MAX_REVISE_ATTEMPTS = int(os.environ.get("PIPELINE_MAX_REVISE", "1"))
 MAX_TEST_FIX_ATTEMPTS = 1  # Single code-fix attempt after test failures
+PIPELINE_WALLCLOCK_TIMEOUT = int(os.environ.get("PIPELINE_WALLCLOCK_TIMEOUT", "3600"))  # seconds, 0=no limit
 
 
 def _pm_health_check(pm_cfg: dict) -> bool:
@@ -1289,6 +1336,15 @@ def run_pipeline(prompt: str, task_id: str | None = None,
         if not stage_cfg.get("enabled", True):
             log.info("   ⏭️ Stage '%s' disabled", stage)
             continue
+
+        # Pipeline-level wallclock safety: abort if total time exceeds limit
+        if PIPELINE_WALLCLOCK_TIMEOUT and (time.time() - pipeline_start) > PIPELINE_WALLCLOCK_TIMEOUT:
+            log.error("⏰ Pipeline wallclock timeout (%ds) exceeded — aborting at stage '%s'",
+                      PIPELINE_WALLCLOCK_TIMEOUT, stage)
+            stage_log.append({"stage": stage, "elapsed": 0,
+                               "verdict": "timeout", "issues": ["Pipeline wallclock timeout"],
+                               "team": [], "note": "Aborted — pipeline ran too long"})
+            break
 
         _t = int(os.environ.get(
             f"PIPELINE_{stage.upper()}_TIMEOUT",
@@ -1545,6 +1601,13 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 
             if verdict == "revise":
                 log.warning("   ⚠️ PM verdict: REVISE but max attempts reached — proceeding with best effort")
+                # Safety net: if stage output is garbage after all retries, don't
+                # feed it forward — use original prompt as context instead of garbage.
+                if _is_garbage_output(team_outputs):
+                    log.warning("   🛡️ Stage '%s' output is garbage after all retries — "
+                                "dropping garbage from context, using original prompt", stage)
+                    pm_result["handoff"] = f"Stage {stage} produced no usable output. Original task: {prompt}"
+                    pm_result["synthesis"] = pm_result["handoff"]
 
             # Track test results for publish gating
             if stage == "test":
