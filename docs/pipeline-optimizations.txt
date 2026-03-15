@@ -1,0 +1,732 @@
+================================================================================
+  _____           _           ____  _
+ |_   _|_ _ ___| | __      / ___|| | __ ___      __
+   | |/ _` / __| |/ /_____| |    | |/ _` \ \ /\ / /
+   | | (_| \__ \   <|_____| |___ | | (_| |\ V  V /
+   |_|\__,_|___/_|\_\      \____||_|\__,_| \_/\_/
+
+         Pipeline Optimization Documentation
+================================================================================
+
+Last updated: 2026-03-15
+Source:       task-claw.py (single-file orchestrator, ~3000 lines)
+Test suite:   test_pipeline.py (unit) + test_e2e.py (902 lines, 48 tests)
+
+================================================================================
+  1. WHAT IS TASK-CLAW?
+================================================================================
+
+Task-Claw is a single-file orchestrator that turns any AI coding CLI into a
+managed pipeline team member. A Program Manager (LLM-backed, typically GPT-4o
+via GitHub Models) oversees stateless CLI agents through a structured stage
+flow with quality gates, cross-review, and automatic recovery.
+
+Key properties:
+  - ONE file (task-claw.py) — no modules, packages, or build steps
+  - ONE dependency (pip install requests)
+  - Provider-agnostic — 7 CLI providers today, zero code changes to add more
+  - Self-healing — garbage detection, test-to-code loopback, PM failover
+
+
+================================================================================
+  2. THE MULTI-AGENT PIPELINE
+================================================================================
+
+Full stage progression with revision loops, skip paths, and safety gates:
+
+  +----------+     +------+     +------+     +----------+
+  |  Prompt  |---->|Rewrite|--->| Plan |---->|   Code   |
+  +----------+     +------+     +------+     +----------+
+                                  ^   ^        |    |
+                                  |   |        |    v
+                                  |   |     +----------+
+                                  |   |     | Simplify |
+                                  |   |     +----------+
+                                  |   |        |
+                                  |   +--------+ REVISE (max 1 retry)
+                                  |            v
+                                  |        +------+     +--------+     +---------+
+                                  +--------|  Test |---->| Review |---->| Publish |
+                                  REVISE   +------+     +--------+     +---------+
+                                              |                          |
+                                              +--- loopback on fail ---->+ gated on
+                                                   (re-run code)           test_passed
+
+  Skip paths:
+    - Code produces no diff --> skip Simplify and Test
+    - start_stage parameter --> skip all stages before it
+    - Stage disabled in pipeline.json --> skip
+    - Wallclock timeout (default 3600s) --> abort remaining stages
+
+  PM's three roles at each stage:
+    +-----------+         +----------+         +----------+
+    | 1. DIRECT |-------->| 2. TEAM  |-------->| 3. OVERSEE|
+    | Write task|         | Runs CLI |         | Quality   |
+    | brief for |         | agents   |         | gate:     |
+    | the team  |         | in ||    |         | APPROVE / |
+    +-----------+         +----------+         | REVISE    |
+                                               +----------+
+
+
+================================================================================
+  3. LINKING MULTIPLE AGENTIC SOURCES
+================================================================================
+
+This is Task-Claw's core differentiator: any AI coding CLI becomes a
+pluggable team member through a provider abstraction layer.
+
+--------------------------------------------------------------------------------
+  3a. Provider Abstraction Layer
+--------------------------------------------------------------------------------
+
+Seven providers defined in providers.json — zero code changes to add a new one:
+
+  +------------------+--------+-----------+-------------------------------+
+  | Provider         | Binary | Subcommand| Auto-mode Flag                |
+  +------------------+--------+-----------+-------------------------------+
+  | Claude Code      | claude | (none)    | --dangerously-skip-permissions|
+  | GitHub Copilot   | gh     | copilot   | --yolo                        |
+  | Copilot (Direct) | copilot| (none)    | --yolo                        |
+  | Aider            | aider  | (none)    | --yes --no-auto-commits       |
+  | OpenAI Codex     | codex  | (none)    | --full-auto                   |
+  | Google Gemini    | gemini | (none)    | --sandbox                     |
+  | Amazon Q         | q      | chat      | --trust-all-tools             |
+  +------------------+--------+-----------+-------------------------------+
+
+Each provider entry specifies:
+  - binary + optional subcommand
+  - Per-phase arg templates (plan_args, implement_args, test_args, etc.)
+  - Per-phase timeouts (plan_timeout, implement_timeout, etc.)
+  - Environment variables to inject
+  - {prompt} placeholder replaced at runtime
+
+To add a new provider, add a JSON entry to providers.json:
+
+  "my-new-tool": {
+    "name": "My New Tool",
+    "binary": "mytool",
+    "subcommand": [],
+    "plan_args": ["-p", "{prompt}"],
+    "implement_args": ["-p", "{prompt}", "--auto"],
+    ...
+  }
+
+No code changes needed. The orchestrator discovers it automatically.
+
+--------------------------------------------------------------------------------
+  3b. Phase-Level Provider Routing
+--------------------------------------------------------------------------------
+
+Four-tier resolution cascade (highest priority first):
+
+  +---------------------+
+  | 1. Task override    |  task JSON: "cli_provider": "aider"
+  +---------------------+
+           |
+           v  (not set?)
+  +---------------------+
+  | 2. Phase env var    |  CLI_PLAN_PROVIDER=claude
+  +---------------------+  CLI_IMPLEMENT_PROVIDER=copilot
+           |               CLI_TEST_PROVIDER=aider
+           v  (not set?)   CLI_SECURITY_PROVIDER=gemini
+  +---------------------+  CLI_REVIEW_PROVIDER=codex
+  | 3. Global env var   |  CLI_PROVIDER=claude
+  +---------------------+
+           |
+           v  (not set?)
+  +---------------------+
+  | 4. providers.json   |  "default_provider": "claude"
+  +---------------------+
+
+This enables mix-and-match strategies:
+
+  Example: Claude for planning (deep reasoning), Copilot for coding (fast),
+           Aider for testing (good at reading existing code)
+
+  CLI_PLAN_PROVIDER=claude
+  CLI_IMPLEMENT_PROVIDER=copilot
+  CLI_TEST_PROVIDER=aider
+
+Function: get_provider_for_phase() at line 214 of task-claw.py
+
+--------------------------------------------------------------------------------
+  3c. Multi-Agent Team Execution
+--------------------------------------------------------------------------------
+
+Each pipeline stage has a "team" array in pipeline.json. When the array
+contains multiple providers, they all run in parallel:
+
+  pipeline.json:
+    "code": {
+      "team": ["claude", "copilot"],    <-- 2 agents run in parallel
+      "timeout": 600
+    }
+
+  Execution model (ThreadPoolExecutor):
+
+    run_team()
+        |
+        +---> ThreadPoolExecutor(max_workers=N)
+        |         |
+        |    +----+----+----+
+        |    |    |    |    |
+        |    v    v    v    v
+        |  [claude] [copilot] [aider] [codex]   <-- all get same prompt
+        |    |    |    |    |
+        |    +----+----+----+
+        |         |
+        v    collect results (skip failures)
+    list[(provider_name, output)]
+
+  Key properties:
+    - Each agent is stateless — gets the same prompt, works independently
+    - Individual agent failure doesn't kill the stage
+    - ThreadPoolExecutor timeout = stage timeout + 30s buffer for cleanup
+    - Results collected as (provider_name, output) tuples
+
+  Source: run_team() at line 1014 of task-claw.py
+
+--------------------------------------------------------------------------------
+  3d. Cross-Review & Deep Merge (when team > 1)
+--------------------------------------------------------------------------------
+
+When 2+ agents produce code, Task-Claw runs a cross-review cycle:
+
+  +-------------+     +-------------+
+  | Agent A     |     | Agent B     |
+  | (code)      |     | (code)      |
+  +------+------+     +------+------+
+         |                   |
+         +---+           +---+
+             |           |
+             v           v
+  +----------+-----------+----------+
+  |   Cross-Review (parallel)       |
+  |   A reviews B's code            |
+  |   B reviews A's code            |
+  +----------+-----------+----------+
+             |           |
+             v           v
+  +----------+-----------+----------+
+  |       PM Deep Merge             |
+  |  Receives:                      |
+  |   - Both implementations       |
+  |   - Both cross-reviews          |
+  |  Produces:                      |
+  |   - Comparison analysis         |
+  |   - Gap analysis                |
+  |   - Strength mapping            |
+  |   - Unified merged result       |
+  |   - APPROVE / REVISE verdict    |
+  +--------------------------------+
+
+  Structured cross-review format:
+    ## Agreement Points       - Shared approaches between implementations
+    ## Divergences            - Differences with file:line references
+    ## Issues Found           - Bugs, security, convention violations
+    ## Winner Per Component   - Which is better per feature, and why
+    ## Recommended Merge      - How to combine the best parts
+
+  The PM's deep merge (pm_merge_with_reviews) follows 5 steps:
+    1. Compare: What does each do differently?
+    2. Gap analysis: What did A catch that B missed (and vice versa)?
+    3. Strength mapping: Best contribution from each
+    4. Merged result: Unified implementation taking best of both
+    5. Verdict: APPROVE if production-ready, REVISE if not
+
+  Source: cross_review_code() at line 872, pm_merge_with_reviews() at line 955
+
+--------------------------------------------------------------------------------
+  3e. Prompt Compatibility Layer
+--------------------------------------------------------------------------------
+
+Different CLIs accept prompts in different ways. Task-Claw handles this
+transparently:
+
+  Prompt length check (threshold: 6000 chars):
+
+    prompt.length <= 6000        prompt.length > 6000
+    +-----------------+          +-------------------+
+    | Inline: -p "..." |          | File-based input  |
+    +-----------------+          +-------------------+
+                                   |
+                              +----+----+
+                              |         |
+                         claude:    aider:
+                    --prompt-file  --message-file
+                         path         path
+
+  Provider-specific flag mapping in build_cli_command():
+    - claude  --> --prompt-file <path>
+    - aider   --> --message-file <path>
+    - others  --> fallback to inline with full prompt text
+
+  Windows command-line length handling:
+    - cmd.exe limit: 8191 characters
+    - CreateProcess limit: 32,768 characters
+    - Auto-switch to file-based input above 6000 chars (safe margin)
+
+  Binary resolution:
+    - which() resolves .cmd / .bat / .exe on Windows
+    - Cross-platform: works on Linux/macOS without changes
+
+  Source: build_cli_command() at line 248, _PROMPT_FILE_THRESHOLD at line 245
+
+--------------------------------------------------------------------------------
+  3f. Timeout & Failure Isolation
+--------------------------------------------------------------------------------
+
+  Timeout resolution (per-phase, per-provider):
+
+    +---------------------------+----------+---------+
+    | Source                    | Example  | Priority|
+    +---------------------------+----------+---------+
+    | Env: PIPELINE_CODE_TIMEOUT| 900      | 1 (top) |
+    | providers.json per-phase  | 600      | 2       |
+    | pipeline.json stage       | 300      | 3       |
+    +---------------------------+----------+---------+
+
+  Default timeouts from providers.json:
+    Plan:      900s (15 min)
+    Implement: 600s (10 min)
+    Security:  300s (5 min)
+    Test:      300s (5 min)
+    Review:    300s (5 min)
+
+  Pipeline-level wallclock timeout: 3600s (1 hour, configurable)
+
+  Failure isolation:
+    - Individual agent failure --> warning logged, other agents' output used
+    - ThreadPoolExecutor timeout = stage timeout + 30s buffer
+    - If ALL agents fail --> stage produces empty output, pipeline continues
+    - PM failure --> increment pm_consecutive_failures counter
+    - 2 consecutive PM failures --> switch to direct mode (no API calls)
+
+
+================================================================================
+  4. PM OVERSIGHT MODEL
+================================================================================
+
+The Program Manager plays three distinct roles in a control loop:
+
+  For each stage in [plan, code, simplify, test, review]:
+
+    +--[ PM as DIRECTOR ]--+
+    |  Writes task brief:   |
+    |  - Stage requirements |
+    |  - Context from prior |
+    |    stages             |
+    |  - Quality criteria   |
+    +----------+-----------+
+               |
+               v
+    +--[ TEAM EXECUTES ]---+
+    |  CLI agents run in   |
+    |  parallel with brief |
+    |  (stateless tools)   |
+    +----------+-----------+
+               |
+               v
+    +--[ PM as OVERSEER ]--+
+    |  Quality gate:        |
+    |  1. Requirements met? |
+    |  2. Bugs/incomplete?  |
+    |  3. Drifted from plan?|
+    |  4. Verdict:          |
+    |     APPROVE --> next  |
+    |     REVISE  --> retry |
+    +----------+-----------+
+               |
+         +-----+-----+
+         |           |
+      APPROVE     REVISE (max 1 retry)
+         |           |
+         v           v
+      Next stage   Re-run with
+                   PM feedback
+
+  When team > 1 at code stage, PM also acts as MERGER:
+    - Receives all implementations + cross-reviews
+    - Produces deep-merged unified output
+
+  PM failover cascade:
+    PM available? --yes--> Try API call
+                            |
+                        Success? --yes--> Reset failure count, continue
+                            |
+                           no
+                            |
+                        Increment pm_consecutive_failures
+                            |
+                        failures >= 2? --yes--> DIRECT MODE
+                            |                   (no PM API calls,
+                           no                    CLI gets raw prompts)
+                            |
+                        Continue with PM
+
+  Configurable PM backend:
+    - github_models (GPT-4o via GitHub Models API, needs GITHUB_TOKEN)
+    - anthropic (Claude API, needs ANTHROPIC_API_KEY)
+    - openai_compatible (any OpenAI-compatible endpoint, set PIPELINE_PM_URL)
+
+
+================================================================================
+  5. QUALITY & CONTEXT CONTROLS
+================================================================================
+
+  Garbage Detection (tiered scoring):
+  +--------------------------+--------+----------------------------------+
+  | Signal Type              | Points | Condition                        |
+  +--------------------------+--------+----------------------------------+
+  | Strong: multi-word       | 2 pts  | Always counted                   |
+  |   "could you approve"    |        |                                  |
+  |   "write permission"     |        |                                  |
+  |   "please describe"      |        |                                  |
+  | Weak: single patterns    | 1 pt   | Only if output < 500 chars       |
+  |   short questions, "?"   |        | OR contains question marks       |
+  | Trivially short          | auto   | Total output < 100 chars         |
+  +--------------------------+--------+----------------------------------+
+  | Threshold: score >= 2 --> garbage                                    |
+  +----------------------------------------------------------------------+
+
+  When garbage is detected:
+    - In PM mode: returns REVISE verdict without calling PM API
+    - In direct mode: retries with plan-only context
+
+  Context Management:
+    - _cap_context(): limits pipeline context to 12,000 chars
+    - Splits on === ... === delimiters (stage boundaries)
+    - Smart eviction: drops oldest NON-plan sections first
+    - Plan section is always preserved (last to be dropped)
+
+    Context flow:
+      Stage 1 output (cleaned) --> append to context
+      Stage 2 output (cleaned) --> append to context
+      ...
+      Context > 12K chars? --> evict oldest non-plan sections
+
+  Output Cleaning:
+    - _clean_stage_output(): strips garbage pattern lines before forwarding
+    - Prevents garbage lines from contaminating downstream stages
+
+
+================================================================================
+  6. AUTOMATIC RECOVERY LOOPS
+================================================================================
+
+  +--[ Test-to-Code Loopback ]--------------------------------------------+
+  |                                                                        |
+  |  Test stage output                                                     |
+  |       |                                                                |
+  |       v                                                                |
+  |  _test_found_failures()                                                |
+  |       |                                                                |
+  |  +----+----+                                                           |
+  |  |         |                                                           |
+  | pass     FAIL detected (word-boundary matching, avoids false positives)|
+  |  |         |                                                           |
+  |  v         v                                                           |
+  | Next    _extract_test_failures() --> structured failure context         |
+  | stage        |                                                         |
+  |              v                                                         |
+  |         Re-run CODE stage with failure context (max 1 attempt)         |
+  |              |                                                         |
+  |              v                                                         |
+  |         Re-run TEST stage to verify fix                                |
+  +------------------------------------------------------------------------+
+
+  +--[ Garbage Retry ]----------------------------------------------------+
+  |                                                                        |
+  |  CLI output is garbage (permission denial, questions, too short)        |
+  |       |                                                                |
+  |       v                                                                |
+  |  _extract_plan_context(context)  <-- preserve just the plan            |
+  |       |                                                                |
+  |       v                                                                |
+  |  _build_direct_prompt(stage, prompt, plan_context)                     |
+  |       |                                                                |
+  |       v                                                                |
+  |  Re-run team with clean prompt (plan context only, no garbage)         |
+  |       |                                                                |
+  |  +----+----+                                                           |
+  |  |         |                                                           |
+  | good    still garbage --> accept empty, continue pipeline              |
+  |  |                                                                     |
+  |  v                                                                     |
+  | Use retry output                                                       |
+  +------------------------------------------------------------------------+
+
+  +--[ PM Failover ]------------------------------------------------------+
+  |                                                                        |
+  |  PM API call fails (rate limit, network, auth)                         |
+  |       |                                                                |
+  |       v                                                                |
+  |  pm_consecutive_failures++                                             |
+  |       |                                                                |
+  |  failures >= 2?                                                        |
+  |  +----+----+                                                           |
+  |  |         |                                                           |
+  | no        yes --> DIRECT MODE for rest of pipeline                     |
+  |  |                (no PM API calls, CLI gets actionable prompts)       |
+  |  v                                                                     |
+  | Continue with PM (next call may succeed)                               |
+  +------------------------------------------------------------------------+
+
+  +--[ Revision Loop ]----------------------------------------------------+
+  |                                                                        |
+  |  PM returns REVISE with issue list                                     |
+  |       |                                                                |
+  |       v                                                                |
+  |  Attempt count < PIPELINE_MAX_REVISE (default: 1)?                     |
+  |  +----+----+                                                           |
+  |  |         |                                                           |
+  | yes       no --> accept current output, continue                       |
+  |  |                                                                     |
+  |  v                                                                     |
+  |  Re-run stage with PM feedback appended to prompt                      |
+  |       |                                                                |
+  |       v                                                                |
+  |  PM oversees again --> APPROVE or REVISE (no more retries)             |
+  +------------------------------------------------------------------------+
+
+
+================================================================================
+  7. SAFETY GATES
+================================================================================
+
+  Pipeline publish decision tree:
+
+    Code stage
+        |
+        v
+    Made file changes?
+    +----+----+
+    |         |
+   yes       no --> skip simplify, test; publish with "no changes" note
+    |
+    v
+    [Simplify] --> [Test]
+                     |
+                     v
+                Tests passed?
+                +----+----+
+                |         |
+               yes       no --> test_passed = False
+                |                   |
+                v                   v
+             [Review]          [Code loopback]
+                |                   |
+                v                   v
+          Security audit       Re-test
+           7 categories            |
+                |              still fail? --> test_passed = False
+                v
+          Severity?
+          +----+----+----+
+          |    |         |
+         LOW  MED      HIGH
+          |    |         |
+          v    v         v
+        pass  auto-   REVERT +
+              fix     BLOCK publish
+              attempt   |
+                        v
+                  status = "security-blocked"
+
+  Security review categories:
+    1. Input validation        5. Authentication/authorization
+    2. SQL/command injection   6. Error handling/info leakage
+    3. XSS / output encoding  7. Dependency vulnerabilities
+    4. File system access
+
+  Publish gate:
+    - test_passed must be True
+    - Security severity must not be HIGH
+    - Both conditions required for git commit + push
+
+
+================================================================================
+  8. E2E TEST SUITE -- SWARM-VALIDATED QUALITY
+================================================================================
+
+The pipeline is validated by a comprehensive E2E test suite (test_e2e.py,
+902 lines, 48 tests across 10 classes) born from a swarm test that ran
+multiple parallel pipeline instances and uncovered 5 critical bugs.
+
+  Realistic Mock Data:
+    - Not generic stubs -- stage-specific realistic outputs
+    - JWT auth plan, code with implementation notes
+    - Test runs with 8 test cases, PM verdicts with synthesis
+    - Garbage variants for each failure mode
+
+  Test Coverage Matrix:
+
+  +-----------------------------+---+-------------------------------------------+
+  | Test Class                  | # | What It Validates                         |
+  +-----------------------------+---+-------------------------------------------+
+  | TestContextFlow             | 5 | Context passes between stages, plan       |
+  |                             |   | survives capping                          |
+  | TestNoChangeDetection       | 5 | Simplify/test skip when code produces     |
+  |                             |   | no diff                                   |
+  | TestGarbageSafetyNet        | 4 | Garbage patterns detected, bad output     |
+  |                             |   | not propagated                            |
+  | TestWallclockTimeout        | 4 | Pipeline aborts on timeout, completed     |
+  |                             |   | stages preserved                          |
+  | TestPromptSystem            | 5 | Prompt loading, caching, fallbacks,       |
+  |                             |   | CLI size warnings                         |
+  | TestPromptFileSwitching     | 4 | Long prompts --> file-based input,        |
+  |                             |   | provider-specific flags                   |
+  | TestRealisticHappyPath      | 3 | Full direct & PM mode runs,              |
+  |                             |   | test-failure recovery                     |
+  | TestRealisticPMInteractions | 4 | PM approve/revise flow, garbage           |
+  |                             |   | short-circuits PM                         |
+  | TestCrossReviewMerge        | 4 | Multi-agent cross-review, comparison      |
+  |                             |   | summary, merge                            |
+  | TestEdgeCases               | 5 | Disabled stages, start_stage skip,        |
+  |                             |   | security HIGH blocks                      |
+  +-----------------------------+---+-------------------------------------------+
+  | TOTAL                       |43*| * 48 tests across all classes             |
+  +-----------------------------+---+-------------------------------------------+
+
+  Swarm Test Origin:
+    The swarm test discovered 5 critical bugs:
+      1. Windows cmd-line truncation on long prompts
+      2. Garbage output propagation after REVISE verdict
+      3. Timeout hangs when ThreadPoolExecutor didn't get buffer
+      4. Six new garbage patterns not previously detected
+      5. Stale diff reviews when code stage made no changes
+
+  Canary File:
+    _pipeline_canary.txt is written at pipeline start as a diagnostic marker.
+    Records code version, timestamp, and feature flags (garbage detection,
+    direct mode). Used to verify the correct code is running.
+
+  Running tests:
+    python -m unittest test_e2e -v                    # all E2E tests
+    python -m unittest test_e2e.TestContextFlow -v     # single class
+    python -m unittest test_pipeline -v                # unit tests
+
+
+================================================================================
+  9. PIPELINE STATS & MONITORING
+================================================================================
+
+  Per-stage tracking:
+    - CLI call counts (how many times each provider was invoked)
+    - Subagent spawns (cross-review, merge calls)
+    - Tool usage tracking
+
+  Web UI (http://localhost:8099/):
+    /                  Tasks + Ideas page (CRUD, photos, filters)
+    /pipeline.html     Live pipeline monitor + config editor
+
+  Pipeline history:
+    GET /api/pipeline-history     List completed runs
+    GET /api/pipeline-stats       Per-stage statistics
+    GET /pipeline-output/{id}     View stage outputs for a run
+
+  Stage output files:
+    pipeline-output/{task-id}/
+      rewrite.md       PM-rewritten prompt
+      plan.md          Implementation plan
+      code.md          Code stage output
+      code-{agent}.md  Per-agent output (multi-agent mode)
+      simplify.md      Simplification pass
+      test.md          Test results
+      review.md        Security review
+
+
+================================================================================
+  10. CONFIGURATION QUICK REFERENCE
+================================================================================
+
+  Key Environment Variables:
+
+  +----------------------------+---------+-------------------------------------+
+  | Variable                   | Default | Purpose                             |
+  +----------------------------+---------+-------------------------------------+
+  | PROJECT_DIR                | (agent) | Target project the agent edits      |
+  | GITHUB_TOKEN               | --      | GitHub Models PM + git push         |
+  | CLI_PROVIDER               | claude  | Default CLI provider                |
+  | CLI_PLAN_PROVIDER          | --      | Override provider for plan stage    |
+  | CLI_IMPLEMENT_PROVIDER     | --      | Override provider for code stage    |
+  | CLI_TEST_PROVIDER          | --      | Override provider for test stage    |
+  | CLI_SECURITY_PROVIDER      | --      | Override provider for security      |
+  | CLI_REVIEW_PROVIDER        | --      | Override provider for review stage  |
+  | AGENT_POLL_INTERVAL        | 3600    | Seconds between poll cycles         |
+  | AGENT_MAX_CALLS            | 10      | Daily API call cap                  |
+  | AGENT_TRIGGER_PORT         | 8099    | HTTP server port                    |
+  | PIPELINE_FILE              | (json)  | Pipeline + PM config file           |
+  | PIPELINE_MANAGER_TIMEOUT   | 300     | PM API call timeout (seconds)       |
+  | PIPELINE_MAX_REVISE        | 1       | Max revision attempts per stage     |
+  | PIPELINE_WALLCLOCK_TIMEOUT | 3600    | Total pipeline time limit (seconds) |
+  +----------------------------+---------+-------------------------------------+
+
+  pipeline.json structure:
+
+    {
+      "program_manager": {
+        "backend": "github_models",   // or "anthropic", "openai_compatible"
+        "model": "gpt-4o",
+        "max_tokens": 4096,
+        "temperature": 0.3
+      },
+      "stages": {
+        "<stage>": {
+          "enabled": true,
+          "team": ["claude"],          // or ["claude", "copilot"] for multi-agent
+          "timeout": 600,
+          "description": "..."
+        }
+      },
+      "publish": {
+        "enabled": true,
+        "auto_push": true,
+        "block_on_severity": "high"
+      }
+    }
+
+  providers.json structure:
+
+    {
+      "providers": {
+        "<name>": {
+          "name": "Display Name",
+          "binary": "cli-binary",
+          "subcommand": [],
+          "plan_args": ["-p", "{prompt}"],
+          "implement_args": ["-p", "{prompt}", "--auto-flag"],
+          "test_args": [...],
+          "review_args": [...],
+          "plan_timeout": 900,
+          "implement_timeout": 600,
+          "env": {}
+        }
+      },
+      "default_provider": "claude"
+    }
+
+
+================================================================================
+  KEY SOURCE FILES
+================================================================================
+
+  task-claw.py        All optimization logic (~3000 lines)
+    Lines 199-320     Provider system (resolution, command building)
+    Lines 712-734     Garbage detection (tiered scoring)
+    Lines 872-952     Cross-review code + comparison summary
+    Lines 955-1008    PM deep merge with reviews
+    Lines 1014-1073   Parallel team execution (ThreadPoolExecutor)
+    Lines 1091-1143   Context capping + plan extraction
+    Lines 1187-1260   Test failure detection + extraction
+    Lines 1270-1686   Pipeline flow (run_pipeline)
+
+  providers.json      7 provider definitions
+  pipeline.json       Stage config with team arrays + PM settings
+  prompts.json        Externalized prompt templates
+  test_e2e.py         48 E2E tests, 902 lines, swarm-validated
+  test_pipeline.py    Unit tests for pure functions and pipeline flow
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
