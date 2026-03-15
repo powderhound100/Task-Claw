@@ -1,14 +1,17 @@
 """
-Comprehensive test harness for the Task-Claw pipeline.
+Unit tests for Task-Claw pipeline pure functions and unique flow tests.
+
+Pipeline flow tests (happy path, PM failover, garbage retry, loopback, security
+block) live in test_e2e.py. This file covers pure function edge cases and the
+publish-gating test not covered by E2E.
 
 Run with:
-    python -m unittest test_pipeline.py -v
+    python -m unittest test_pipeline -v
 """
 
 import importlib.util
 import json
 import os
-import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -120,34 +123,13 @@ class TestTestFoundFailures(unittest.TestCase):
 
 
 class TestParseOverseerResponse(unittest.TestCase):
-    """Tests for _parse_overseer_response()."""
-
-    def test_well_formed_approve(self):
-        text = make_pm_response(verdict="APPROVE")
-        result = tc._parse_overseer_response(text)
-        self.assertEqual(result["verdict"], "approve")
-        self.assertEqual(result["issues"], [])
-        self.assertTrue(len(result["synthesis"]) > 0)
-
-    def test_well_formed_revise(self):
-        text = make_pm_response(
-            verdict="REVISE",
-            issues=["Bug found in parser", "Missing test coverage"]
-        )
-        result = tc._parse_overseer_response(text)
-        self.assertEqual(result["verdict"], "revise")
-        self.assertEqual(len(result["issues"]), 2)
-        self.assertIn("Bug found in parser", result["issues"])
+    """Edge-case tests for _parse_overseer_response().
+    Well-formed approve/revise covered by test_e2e.TestRealisticPMInteractions."""
 
     def test_missing_verdict_defaults_approve(self):
         text = "## Synthesis\nLooks good overall.\n\n## Issues\nNone"
         result = tc._parse_overseer_response(text)
         self.assertEqual(result["verdict"], "approve")
-
-    def test_issues_none_string(self):
-        text = make_pm_response(verdict="APPROVE")
-        result = tc._parse_overseer_response(text)
-        self.assertEqual(result["issues"], [])
 
     def test_empty_string(self):
         # Empty string has no ## Verdict and no approval signals, so defaults to "revise"
@@ -367,236 +349,40 @@ class TestParseClaudeJsonOutput(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PIPELINE FLOW TESTS — mocked
+#  PIPELINE FLOW TEST — publish gating (unique; other flow tests in test_e2e)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class PipelineTestBase(unittest.TestCase):
-    """Base class for pipeline flow tests with common setUp/tearDown."""
 
-    def setUp(self):
-        """Reset agent state and set up common patches."""
+class TestPublishGating(unittest.TestCase):
+    """Test that test failures block publish — not covered by E2E."""
+
+    def test_test_failure_blocks_publish(self):
         with tc.status_lock:
             tc.agent_status["state"] = "idle"
             tc.agent_status["current_task"] = None
             tc.agent_status["current_stage"] = None
         tc._reset_pipeline_stats()
 
-        # Common patches
-        self.patches = []
-
-        # Mock _save_stage_output to avoid creating real directories
-        p = patch.object(tc, "_save_stage_output", return_value=Path("/fake/output.md"))
-        self.mock_save = p.start()
-        self.patches.append(p)
-
-        # Mock _git_commit_and_push
-        p = patch.object(tc, "_git_commit_and_push", return_value=True)
-        self.mock_git = p.start()
-        self.patches.append(p)
-
-        # Mock _restart_changed_services
-        p = patch.object(tc, "_restart_changed_services")
-        self.mock_restart = p.start()
-        self.patches.append(p)
-
-        # Mock rewrite_prompt to passthrough
-        p = patch.object(tc, "rewrite_prompt", side_effect=lambda prompt, cfg: prompt)
-        self.mock_rewrite = p.start()
-        self.patches.append(p)
-
-        # Mock run_security_review
-        p = patch.object(tc, "run_security_review",
-                         return_value={"max_severity": "LOW", "report": "All clear. No issues found."})
-        self.mock_security = p.start()
-        self.patches.append(p)
-
-        # Mock _handle_security_findings
-        p = patch.object(tc, "_handle_security_findings", return_value="ok")
-        self.mock_handle_sec = p.start()
-        self.patches.append(p)
-
-    def tearDown(self):
-        for p in self.patches:
-            p.stop()
-
-    def _good_team_output(self, name="claude"):
-        return [(name, GOOD_OUTPUT)]
-
-
-class TestPipelineHappyPath(PipelineTestBase):
-    """Test that a fully-approved pipeline completes successfully."""
-
-    def test_all_stages_pass(self):
-        with patch.object(tc, "_pm_health_check", return_value=True), \
-             patch.object(tc, "run_team", return_value=self._good_team_output()), \
-             patch.object(tc, "_pm_api_call", return_value=make_pm_response()), \
-             patch.object(tc, "pm_direct_team", return_value=(GOOD_OUTPUT, True)), \
-             patch.object(tc, "pm_oversee_stage", return_value=tc._parse_overseer_response(make_pm_response())):
-
-            result = tc.run_pipeline("Add a login feature", task_id="test-happy")
-
-        self.assertTrue(result["success"])
-        self.assertTrue(result["published"])
-        # Should have entries for all stages: rewrite, plan, code, simplify, test, review
-        stage_names = [entry["stage"] for entry in result["stage_log"]]
-        for expected in ["rewrite", "plan", "code", "simplify", "test", "review"]:
-            self.assertIn(expected, stage_names,
-                          f"Missing stage '{expected}' in stage_log: {stage_names}")
-        self.assertIsNone(result["error"])
-
-
-class TestPipelinePMFailover(PipelineTestBase):
-    """Test that PM failure gracefully falls back to direct mode."""
-
-    def test_pm_failure_falls_to_direct(self):
-        with patch.object(tc, "_pm_health_check", return_value=False), \
-             patch.object(tc, "run_team", return_value=self._good_team_output()):
-
-            result = tc.run_pipeline("Add a login feature", task_id="test-failover")
-
-        self.assertTrue(result["success"])
-        # In direct mode, stages should still complete
-        stage_names = [entry["stage"] for entry in result["stage_log"]]
-        self.assertIn("plan", stage_names)
-        self.assertIn("code", stage_names)
-
-
-class TestPipelineGarbageRetry(PipelineTestBase):
-    """Test garbage detection and retry behavior."""
-
-    def test_garbage_triggers_retry(self):
-        call_count = {"n": 0}
-
-        def mock_run_team(*args, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] <= 1:
-                # First call per stage is garbage for the plan stage
-                stage = args[0] if args else kwargs.get("stage_name", "")
-                if stage == "plan" and call_count["n"] == 1:
-                    return [("claude", "I don't have access to the files.")]
-                return self._good_team_output()
-            return self._good_team_output()
-
-        with patch.object(tc, "_pm_health_check", return_value=False), \
-             patch.object(tc, "run_team", side_effect=mock_run_team):
-
-            result = tc.run_pipeline("Add a login feature", task_id="test-garbage-retry")
-
-        self.assertTrue(result["success"])
-
-    def test_double_garbage_skips_stage(self):
-        def mock_run_team_garbage(*args, **kwargs):
-            stage = args[0] if args else ""
-            if stage == "plan":
-                return [("claude", "I don't have access")]
-            return self._good_team_output()
-
-        with patch.object(tc, "_pm_health_check", return_value=False), \
-             patch.object(tc, "run_team", side_effect=mock_run_team_garbage):
-
-            result = tc.run_pipeline("Add a login feature", task_id="test-double-garbage")
-
-        self.assertTrue(result["success"])
-        # Plan stage result should be empty
-        self.assertEqual(result["stage_results"].get("plan", ""), "")
-
-
-class TestPipelineTestCodeLoopback(PipelineTestBase):
-    """Test that test failures trigger a code-fix loopback."""
-
-    def test_failures_trigger_fix(self):
-        call_count = {"n": 0}
-
-        def mock_run_team(stage_name, *args, **kwargs):
-            call_count["n"] += 1
-            if stage_name == "test":
-                return [("claude",
-                         "Running tests... SyntaxError found in code at line 42. "
-                         "The function parse_data has an unclosed parenthesis. "
-                         "This needs to be fixed before the code can run. " * 3)]
-            return self._good_team_output()
-
-        with patch.object(tc, "_pm_health_check", return_value=False), \
-             patch.object(tc, "run_team", side_effect=mock_run_team):
-
-            result = tc.run_pipeline("Add a login feature", task_id="test-loopback")
-
-        self.assertTrue(result["success"])
-        stage_names = [entry["stage"] for entry in result["stage_log"]]
-        self.assertIn("code-fix", stage_names)
-
-    def test_passing_tests_no_loopback(self):
-        def mock_run_team(stage_name, *args, **kwargs):
-            if stage_name == "test":
-                return [("claude",
-                         "All tests passed, everything looks good. "
-                         "The implementation is correct and handles all edge cases properly. "
-                         "No issues were found during testing. " * 3)]
-            return self._good_team_output()
-
-        with patch.object(tc, "_pm_health_check", return_value=False), \
-             patch.object(tc, "run_team", side_effect=mock_run_team):
-
-            result = tc.run_pipeline("Add a login feature", task_id="test-no-loopback")
-
-        self.assertTrue(result["success"])
-        stage_names = [entry["stage"] for entry in result["stage_log"]]
-        self.assertNotIn("code-fix", stage_names)
-
-
-class TestPipelinePublishGating(PipelineTestBase):
-    """Validates Phase 1a — test_passed flag gating publish."""
-
-    def test_test_failure_blocks_publish(self):
         def mock_run_team(stage_name, *args, **kwargs):
             if stage_name == "test":
                 return [("claude",
                          "FAIL: test_login failed with AssertionError. "
                          "Expected 200 but got 500. The server crashes on login. " * 3)]
-            return self._good_team_output()
+            return [("claude", GOOD_OUTPUT)]
 
-        with patch.object(tc, "_pm_health_check", return_value=False), \
+        with patch.object(tc, "_save_stage_output", return_value=Path("/fake/output.md")), \
+             patch.object(tc, "_git_commit_and_push", return_value=True), \
+             patch.object(tc, "_restart_changed_services"), \
+             patch.object(tc, "rewrite_prompt", side_effect=lambda prompt, cfg: prompt), \
+             patch.object(tc, "run_security_review",
+                          return_value={"max_severity": "LOW", "report": "All clear."}), \
+             patch.object(tc, "_handle_security_findings", return_value="ok"), \
+             patch.object(tc, "_pm_health_check", return_value=False), \
              patch.object(tc, "run_team", side_effect=mock_run_team):
 
             result = tc.run_pipeline("Add a login feature", task_id="test-block-pub")
 
         self.assertFalse(result["published"])
-
-    def test_test_pass_allows_publish(self):
-        def mock_run_team(stage_name, *args, **kwargs):
-            if stage_name == "test":
-                return [("claude",
-                         "All tests passed. 12 tests ran, 0 failures. "
-                         "The implementation is correct. " * 3)]
-            return self._good_team_output()
-
-        with patch.object(tc, "_pm_health_check", return_value=False), \
-             patch.object(tc, "run_team", side_effect=mock_run_team):
-
-            result = tc.run_pipeline("Add a login feature", task_id="test-allow-pub")
-
-        self.assertTrue(result["published"])
-
-
-class TestPipelineSecurityBlock(PipelineTestBase):
-    """Test that HIGH severity security findings block publishing."""
-
-    def test_high_severity_blocks(self):
-        with patch.object(tc, "_pm_health_check", return_value=False), \
-             patch.object(tc, "run_team", return_value=self._good_team_output()), \
-             patch.object(tc, "run_security_review",
-                          return_value={"max_severity": "HIGH",
-                                        "report": "Critical SQL injection vulnerability found."}), \
-             patch.object(tc, "_handle_security_findings", return_value="blocked"), \
-             patch.object(tc, "pm_oversee_stage",
-                          return_value=tc._parse_overseer_response(make_pm_response())):
-
-            result = tc.run_pipeline("Add a login feature", task_id="test-sec-block")
-
-        self.assertFalse(result["published"])
-        # Pipeline should report failure when blocked
-        self.assertFalse(result["success"])
-        self.assertIn("security", result.get("error", "").lower())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
