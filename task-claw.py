@@ -72,8 +72,6 @@ GITHUB_MODELS_URL = os.environ.get("GITHUB_MODELS_URL",
 GITHUB_MODELS_MODEL = os.environ.get("GITHUB_MODELS_MODEL", "gpt-4o")
 MAX_API_CALLS_PER_DAY = _env_int("AGENT_MAX_CALLS", 10)
 
-SESSION_DIR = Path(os.environ.get("AGENT_SESSION_DIR",
-                                   str(Path.home() / ".copilot" / "session-state")))
 AUTO_IMPLEMENT_DEFAULT = os.environ.get("AGENT_AUTO_IMPLEMENT_DEFAULT", "true").lower() == "true"
 
 # ── Security config ──────────────────────────────────────────────────────────
@@ -684,6 +682,19 @@ _FALLBACK_PROMPTS: dict = {
         "(research/investigate/look into), convert it into a concrete coding task: "
         "diagnose the root cause AND fix it. Structure as: WHAT, WHERE, WHY, CONSTRAINTS. "
         "Return only the rewritten prompt.\n\nOriginal request:\n{prompt}"),
+    "pm_extract_requirements": (
+        "Extract discrete, testable requirements from this user request. "
+        "Each requirement should be ONE specific thing the code must do or the plan must address. "
+        "Number each requirement (1., 2., etc.). Be specific.\n\n"
+        "User request:\n{prompt}"),
+    "pm_plan_checklist": (
+        "## Requirements Checklist\n"
+        "For each requirement, state COVERED or MISSING:\n{checklist}\n\n"
+        "If ANY requirement is MISSING, verdict MUST be REVISE."),
+    "pm_code_traceability": (
+        "## Plan-to-Code Traceability\n"
+        "For each plan step, state DONE, PARTIAL, or MISSING:\n{plan}\n\n"
+        "If ANY step is MISSING, verdict MUST be REVISE with unimplemented steps listed."),
 }
 
 # Loaded once at init (before threads spawn); None = not yet loaded.
@@ -858,6 +869,81 @@ def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict,
     raise last_err  # should not reach here, but just in case
 
 
+def _pm_extract_requirements(prompt: str, pm_cfg: dict) -> list[str]:
+    """Call PM API to extract discrete, testable requirements from the prompt.
+
+    Returns a list of numbered requirement strings.
+    On failure: returns empty list (graceful degradation).
+    """
+    template = _get_prompt("pm_extract_requirements", fallback=(
+        "Extract discrete, testable requirements from this user request. "
+        "Number each (1., 2., etc.).\n\nUser request:\n{prompt}"))
+    user_msg = template.replace("{prompt}", prompt)
+    system_msg = _get_prompt("pm_system", "overseer")
+    try:
+        result = _pm_api_call(system_msg, user_msg, pm_cfg)
+        # Parse numbered lines: "1. ...", "2. ...", etc.
+        requirements = []
+        for line in result.splitlines():
+            line = line.strip()
+            m = re.match(r'^\d+\.\s+(.+)', line)
+            if m:
+                requirements.append(m.group(1).strip())
+        if requirements:
+            log.info("   PM extracted %d requirements from prompt", len(requirements))
+        else:
+            log.warning("   PM returned no parseable requirements")
+        return requirements
+    except Exception as e:
+        log.warning("⚠️ PM requirements extraction failed (%s) — continuing without", e)
+        return []
+
+
+def _fire_hooks(event: str, data: dict, pipeline_cfg: dict) -> list[dict]:
+    """Fire webhook hooks for a pipeline event.
+
+    Events: on_stage_start, on_stage_end, on_verdict.
+    Each hook entry: {"type": "webhook", "url": "...", "timeout": 5, "can_override": false}
+    Failures are logged, never block the pipeline.
+    Returns list of response dicts from hooks that returned JSON.
+    """
+    hooks_cfg = pipeline_cfg.get("hooks", {})
+    hook_list = hooks_cfg.get(event, [])
+    if not hook_list:
+        return []
+
+    data["event"] = event
+    data["timestamp"] = datetime.now(timezone.utc).isoformat()
+    responses = []
+
+    def _call_hook(hook):
+        if hook.get("type") != "webhook":
+            return None
+        url = hook.get("url", "")
+        if not url:
+            return None
+        timeout = hook.get("timeout", 5)
+        try:
+            resp = requests.post(url, json=data, timeout=timeout)
+            resp.raise_for_status()
+            try:
+                return resp.json()
+            except ValueError:
+                return None
+        except Exception as e:
+            log.warning("   Hook %s failed for %s: %s", url, event, e)
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(_call_hook, h) for h in hook_list]
+        for f in concurrent.futures.as_completed(futures):
+            result = f.result()
+            if result is not None:
+                responses.append(result)
+
+    return responses
+
+
 def pm_direct_team(stage_name: str, original_prompt: str, context: str,
                    team: list, pm_cfg: dict) -> tuple[str, bool]:
     """
@@ -946,11 +1032,15 @@ def _is_garbage_output(team_outputs: list) -> bool:
 
 
 def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
-                     team_outputs: list, pm_cfg: dict) -> dict:
+                     team_outputs: list, pm_cfg: dict,
+                     requirements: list[str] | None = None) -> dict:
     """
-    PM acts as overseer AFTER the team runs. Instead of just picking/merging,
-    the PM verifies stage output against requirements, flags quality issues,
-    and decides whether to APPROVE (pass to next stage) or REVISE (needs rework).
+    PM acts as overseer AFTER the team runs. Verifies stage output against
+    requirements, flags quality issues, decides APPROVE or REVISE.
+
+    When requirements are provided:
+    - Plan stage: appends a checklist asking PM to mark each requirement COVERED/MISSING
+    - Code stage: appends traceability asking PM to mark each plan step DONE/PARTIAL/MISSING
 
     Returns {"verdict": "approve"|"revise", "synthesis": str, "handoff": str,
              "issues": list[str], "full_response": str}
@@ -961,6 +1051,26 @@ def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
     )
     system_msg = _get_prompt("pm_system", "overseer")
     criteria = _get_prompt("pm_stage_criteria", stage_name)
+
+    # Build stage-specific enhanced validation prompts
+    enhanced_section = ""
+    if stage_name == "plan" and requirements:
+        checklist = "\n".join(f"- [ ] {r}" for r in requirements)
+        template = _get_prompt("pm_plan_checklist", fallback=(
+            "## Requirements Checklist\n"
+            "For each requirement, state COVERED or MISSING:\n{checklist}\n\n"
+            "If ANY requirement is MISSING, verdict MUST be REVISE."))
+        enhanced_section = "\n\n" + template.replace("{checklist}", checklist)
+
+    elif stage_name == "code":
+        plan_text = _extract_plan_context(context)
+        if plan_text:
+            template = _get_prompt("pm_code_traceability", fallback=(
+                "## Plan-to-Code Traceability\n"
+                "For each plan step, state DONE, PARTIAL, or MISSING:\n{plan}\n\n"
+                "If ANY step is MISSING, verdict MUST be REVISE."))
+            enhanced_section = "\n\n" + template.replace("{plan}", plan_text)
+
     user_msg = (
         f"Stage: {stage_name}\n"
         f"Original user request: {original_prompt}\n\n"
@@ -971,7 +1081,8 @@ def pm_oversee_stage(stage_name: str, original_prompt: str, context: str,
         "1. **Requirements check**: missed requirements or gaps?\n"
         "2. **Quality check**: bugs, incomplete work?\n"
         "3. **Drift check**: deviated from plan?\n"
-        "4. **Verdict**: APPROVE only if ALL standards met. REVISE if in doubt.\n\n"
+        "4. **Verdict**: APPROVE only if ALL standards met. REVISE if in doubt."
+        f"{enhanced_section}\n\n"
         "## Verdict\nAPPROVE or REVISE\n\n"
         "## Issues\n[problems, or 'None']\n\n"
         "## Synthesis\n[best combined output]\n\n"
@@ -1510,6 +1621,7 @@ def run_pipeline(prompt: str, task_id: str | None = None,
     pm_consecutive_failures = 0   # track PM failures to switch to direct mode
     test_passed = True            # Phase 1a: gate publish on test results
     code_made_changes = False     # track if code stage actually modified files
+    extracted_requirements: list[str] = []  # populated after rewrite if enabled
 
     # Phase 5e: expose pipeline start time for web UI elapsed display
     with status_lock:
@@ -1599,6 +1711,11 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             _save_stage_output(tid, "rewrite", prompt,
                                notes="PM-rewritten prompt for clarity." if pm_available else "Direct mode — original prompt.")
             log.info("   Rewritten prompt (%d chars)", len(prompt))
+
+            # Extract requirements after rewrite if enabled
+            if pm_cfg.get("extract_requirements") and pm_available:
+                extracted_requirements = _pm_extract_requirements(prompt, pm_cfg)
+
             stage_log.append({"stage": "rewrite", "elapsed": round(time.time() - _stage_start, 1),
                                "verdict": "done", "issues": [], "team": ["pm" if pm_available else "direct"],
                                "note": prompt[:200],
@@ -1652,6 +1769,18 @@ def run_pipeline(prompt: str, task_id: str | None = None,
         # ── Plan / Code / Test ─────────────────────────────────────────────
         # Use direct mode if PM is unavailable or has failed consecutively
         use_direct = not pm_available or pm_consecutive_failures >= 2
+
+        # Fire on_stage_start hooks
+        hook_responses = _fire_hooks("on_stage_start", {
+            "task_id": tid, "stage": stage, "team": team,
+            "prompt_preview": prompt[:500],
+        }, cfg)
+        # Check for inject_context from hooks
+        for hr in hook_responses:
+            injected = hr.get("inject_context")
+            if injected and isinstance(injected, str):
+                context += f"\n\n=== Hook injected context ===\n{injected}\n=== End hook context ==="
+                log.info("   Hook injected %d chars of context into stage '%s'", len(injected), stage)
 
         if use_direct:
             # ── DIRECT mode: no PM, send actionable prompts straight to CLI ──
@@ -1736,15 +1865,21 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                 if not code_made_changes:
                     log.warning("   ⚠️ Code stage produced output but no file changes detected")
 
-            elapsed = time.time() - _stage_start
+            elapsed = round(time.time() - _stage_start, 1)
             log.info("   ✅ Stage '%s' done in %.0fs — DIRECT", stage, elapsed)
-            stage_log.append({"stage": stage, "elapsed": round(elapsed, 1),
+            stage_log.append({"stage": stage, "elapsed": elapsed,
                                "verdict": "direct", "issues": [], "team": team,
                                "note": (stage_results.get(stage) or "")[:200],
                                "output": (stage_results.get(stage) or "")[:2000],
                                "output_file": str(_stage_output_path(tid, stage))})
             with status_lock:
                 agent_status["stage_log"] = list(stage_log)
+            _fire_hooks("on_stage_end", {
+                "task_id": tid, "stage": stage,
+                "output_length": len(stage_results.get(stage, "")),
+                "output_preview": (stage_results.get(stage) or "")[:500],
+                "elapsed": elapsed,
+            }, cfg)
             continue
 
         # ── Full PM mode: PM directs → team runs → PM oversees ───────────
@@ -1812,6 +1947,24 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             if issues:
                 log.info("   PM flagged %d issues in '%s': %s",
                          len(issues), stage, "; ".join(issues[:3]))
+
+            # Fire on_verdict hooks (may override verdict)
+            verdict_responses = _fire_hooks("on_verdict", {
+                "task_id": tid, "stage": stage, "verdict": verdict,
+                "issues": issues, "attempt": attempt,
+                "max_attempts": 1 + MAX_REVISE_ATTEMPTS,
+            }, cfg)
+            for vr in verdict_responses:
+                override = vr.get("override_verdict")
+                if override in ("approve", "revise"):
+                    # Only allow override from hooks with can_override: true
+                    hooks_cfg = cfg.get("hooks", {})
+                    can_override_hooks = [h for h in hooks_cfg.get("on_verdict", [])
+                                          if h.get("can_override")]
+                    if can_override_hooks:
+                        log.info("   Hook overriding verdict: %s → %s", verdict, override)
+                        verdict = override
+                        pm_result["verdict"] = verdict
 
             if verdict == "revise" and attempt < MAX_REVISE_ATTEMPTS:
                 log.warning("   🔄 PM verdict: REVISE (attempt %d/%d) — re-running stage '%s'",
@@ -3001,11 +3154,23 @@ def _has_uncommitted_changes() -> bool:
 
 
 def _restart_changed_services():
-    service_map = {
-        "webui/": "webui", "homeassistant/": "homeassistant",
-        "nodered/": "nodered", "zigbee2mqtt/": "zigbee2mqtt",
-        "mosquitto/": "mosquitto",
-    }
+    """Auto-restart docker-compose services whose files changed.
+
+    Configure via RESTART_SERVICE_MAP env var as comma-separated prefix=service pairs,
+    e.g. "web/:web,api/:api-server". If not set, this is a no-op.
+    """
+    raw_map = os.environ.get("RESTART_SERVICE_MAP", "")
+    if not raw_map:
+        log.debug("   No RESTART_SERVICE_MAP configured — skipping service restarts")
+        return
+    service_map = {}
+    for entry in raw_map.split(","):
+        entry = entry.strip()
+        if "=" in entry:
+            prefix, svc = entry.split("=", 1)
+            service_map[prefix.strip()] = svc.strip()
+    if not service_map:
+        return
     try:
         diff = subprocess.run(["git", "diff", "--name-only"],
                               cwd=str(PROJECT_DIR), capture_output=True, text=True, timeout=10)
@@ -3014,7 +3179,7 @@ def _restart_changed_services():
         for path in changed:
             for prefix, svc in service_map.items():
                 if path.startswith(prefix) and svc not in restarted:
-                    log.info("🔄 Restarting %s (files changed in %s)", svc, prefix)
+                    log.info("Restarting %s (files changed in %s)", svc, prefix)
                     subprocess.run(["docker", "compose", "restart", svc],
                                    cwd=str(PROJECT_DIR), timeout=60)
                     restarted.add(svc)
@@ -3267,9 +3432,12 @@ def main():
     log.info("   Default provider: %s", default)
     log.info("")
 
-    if not GITHUB_TOKEN:
-        log.error("GITHUB_TOKEN is required! Set it in .env")
-        sys.exit(1)
+    pm_backend = _load_pipeline_config().get("program_manager", {}).get("backend", "github_models")
+    if pm_backend == "github_models" and not GITHUB_TOKEN:
+        log.warning("⚠️  GITHUB_TOKEN not set — PM backend 'github_models' will fail.")
+        log.warning("   Set GITHUB_TOKEN in .env, or switch PM backend in pipeline.json")
+        log.warning("   (options: 'anthropic', 'openai_compatible', or set PIPELINE_PM_URL for local)")
+        log.warning("   Pipeline will fall back to direct mode (no PM oversight).")
 
     start_trigger_server()
     state = load_state()

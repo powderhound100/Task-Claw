@@ -1,36 +1,6 @@
-# 🦀 Task-Claw
+# Task-Claw
 
-**A multi-provider autonomous coding agent** that monitors a task queue, plans with AI, implements with any coding CLI, runs a security review, and pushes to production.
-
-## Supported CLI Providers
-
-| Provider | Binary | Plan | Implement | Notes |
-|----------|--------|------|-----------|-------|
-| **GitHub Copilot CLI** | `gh copilot` | `-p "[[PLAN]] ..."` | `-p "..." --yolo` | Default provider |
-| **Copilot (direct)** | `copilot` | `-p "..."` | `-p "..." --yolo` | Without `gh` wrapper |
-| **Claude Code** | `claude` | `-p "..."` | `-p "..." --dangerouslySkipPermissions` | Anthropic |
-| **Aider** | `aider` | `--message "..." --dry-run` | `--message "..." --yes` | Any LLM backend |
-| **OpenAI Codex CLI** | `codex` | `-p "..."` | `-p "..." --full-auto` | OpenAI |
-| **Google Gemini CLI** | `gemini` | `-p "..."` | `-p "..." --sandbox` | Google |
-| **Amazon Q Developer** | `q chat` | `--prompt "..."` | `--prompt "..." --trust-all-tools` | AWS |
-
-Add your own providers in `providers.json`.
-
-## Workflow
-
-```
-Task Queue (tasks.json / ideas.json)
-  ↓
-📐 PLAN  — CLI provider or GPT-4o API generates implementation plan
-  ↓
-🚀 IMPLEMENT — CLI provider executes the plan (--yolo / auto mode)
-  ↓
-🔒 SECURITY REVIEW — Fresh CLI audits diff for secrets, IPs, bad deps
-  ↓  Low/Medium: auto-fix → push
-  ↓  High: revert → block → notify user
-  ↓
-🚀 GIT PUSH — Commit and push to production
-```
+**A standalone, multi-provider autonomous coding agent** with a built-in web UI. It monitors a task queue, orchestrates a multi-stage pipeline (plan, code, test, review), runs security audits, and pushes to production — all from a single Python file.
 
 ## Quick Start
 
@@ -39,7 +9,7 @@ Task Queue (tasks.json / ideas.json)
    git clone https://github.com/powderhound100/Task-Claw.git
    cd Task-Claw
    cp .env.example .env
-   # Edit .env with your GITHUB_TOKEN and PROJECT_DIR
+   # Edit .env — set at least one API key (GITHUB_TOKEN or ANTHROPIC_API_KEY)
    ```
 
 2. **Install dependency:**
@@ -53,99 +23,157 @@ Task Queue (tasks.json / ideas.json)
    # Or on Windows: Start-TaskClaw.bat
    ```
 
+4. **Open the web UI:** `http://localhost:8099/`
+
+## Web UI
+
+Task-Claw includes a self-contained web interface (no external dependencies):
+
+- **Tasks page** (`/`) — Create, edit, delete tasks and ideas. Photo uploads, status filters, agent trigger button.
+- **Pipeline page** (`/pipeline.html`) — Live pipeline monitor, stage stats, run history, skills management, config editor.
+
+## Pipeline
+
+The multi-agent pipeline orchestrated by a Program Manager (PM):
+
+```
+User Prompt
+    |
+[Rewrite] -- PM rewrites prompt for clarity
+    |
+[Plan]    -- PM directs team to plan, oversees quality
+    |                                  <- REVISE if needed
+[Code]    -- PM directs team to implement in parallel
+    |       -> cross-review -> PM deep-merge -> quality gate
+    |                                  <- REVISE if needed
+[Simplify]-- Review changed code for reuse, quality, efficiency
+    |
+[Test]    -- PM directs team to test, oversees results
+    |                                  <- REVISE if needed
+[Review]  -- Structured security audit -> PM verdict
+    |
+[Publish] -- git commit + push (blocked if HIGH severity)
+```
+
+Run a one-shot pipeline from the CLI:
+```bash
+python task-claw.py "Add a /health endpoint to the API"
+```
+
+Or trigger via HTTP:
+```bash
+curl -X POST http://localhost:8099/trigger -d '{"prompt":"Add a /health endpoint"}'
+```
+
+## Supported CLI Providers
+
+| Provider | Binary | Notes |
+|----------|--------|-------|
+| **Claude Code** | `claude` | Anthropic (default) |
+| **GitHub Copilot CLI** | `gh copilot` | Requires `gh` CLI with copilot extension |
+| **Copilot (direct)** | `copilot` | Without `gh` wrapper |
+| **Aider** | `aider` | Any LLM backend |
+| **OpenAI Codex CLI** | `codex` | OpenAI |
+| **Google Gemini CLI** | `gemini` | Google |
+| **Amazon Q Developer** | `q chat` | AWS |
+
+Add your own providers in `providers.json` — no code changes needed.
+
 ## Configuration
 
 ### `.env` — Main config
 
 ```env
-GITHUB_TOKEN=ghp_...        # Required: GitHub token for GPT-4o API
-PROJECT_DIR=C:\MyProject     # Project the agent manages
-TASKS_FILE=path/to/tasks.json
-IDEAS_FILE=path/to/ideas.json
-CLI_PROVIDER=copilot         # Default CLI provider
+# At least one API key required for PM backend:
+GITHUB_TOKEN=ghp_...            # For 'github_models' PM backend + git push
+# ANTHROPIC_API_KEY=sk-ant-...  # For 'anthropic' PM backend
+
+# Project the agent manages (defaults to Task-Claw dir itself)
+# PROJECT_DIR=C:\MyProject
+
+CLI_PROVIDER=claude             # Default CLI provider
+AGENT_MAX_CALLS=10              # Daily PM API call cap
+AGENT_TRIGGER_PORT=8099         # Web UI + API port
 ```
+
+See `.env.example` for all options.
 
 ### Per-phase provider override
 
 ```env
 CLI_PLAN_PROVIDER=copilot       # Use Copilot for planning
 CLI_IMPLEMENT_PROVIDER=claude   # Use Claude Code for implementation
-CLI_SECURITY_PROVIDER=copilot   # Use Copilot for security review
 ```
 
 ### Per-task provider override
 
-In `tasks.json`, set `cli_provider` on individual tasks:
+In the web UI or tasks.json, set `cli_provider` on individual tasks.
 
-```json
-{
-  "id": "task-123",
-  "title": "Add dark mode",
-  "cli_provider": "claude",
-  "planning_backend": "cli"
-}
-```
+### `pipeline.json` — Pipeline + PM config
 
-### `providers.json` — Define CLI providers
+Configure PM backend (`github_models`, `anthropic`, or `openai_compatible`), enable/disable stages, set team members per stage, and control publish behavior.
 
-Each provider defines a binary, subcommands, and argument templates for each phase.
-Use `{prompt}` as a placeholder for the actual prompt text.
+### `providers.json` — CLI provider definitions
 
-```json
-{
-  "providers": {
-    "my-custom-cli": {
-      "name": "My Custom CLI",
-      "binary": "my-cli",
-      "subcommand": [],
-      "plan_args": ["--plan", "{prompt}"],
-      "implement_args": ["--execute", "{prompt}"],
-      "security_args": ["--review", "{prompt}"],
-      "plan_timeout": 900,
-      "implement_timeout": 600,
-      "security_timeout": 300
-    }
-  }
-}
-```
+Each provider defines a binary, subcommands, and argument templates for each phase. Use `{prompt}` as a placeholder.
 
 ## HTTP API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/trigger` | POST | Wake agent immediately |
-| `/status` | GET | Agent status + provider info |
-| `/implement/{id}` | POST | Manually trigger implementation for a planned task |
-| `/research` | POST | Start research for an idea |
-| `/research-status/{id}` | GET | Check research progress |
+| `/trigger` | POST | `{"prompt":"..."}` runs pipeline; no body wakes polling loop |
+| `/status` | GET | Agent state, version, provider list |
+| `/implement/{id}` | POST | Run pipeline from code stage for a planned task |
+| `/research` | POST | Start background research for an idea |
+| `/api/tasks` | GET/POST | List / create tasks |
+| `/api/ideas` | GET/POST | List / create ideas |
+| `/api/skills` | GET/POST | List / create skills |
+| `/api/pipeline-history` | GET | Completed pipeline runs |
+| `/api/config/pipeline` | GET/PUT | Read/write pipeline.json |
+| `/api/config/providers` | GET/PUT | Read/write providers.json |
 
-## Security Review
-
-After every implementation, a **fresh CLI instance** audits the git diff for:
-- Hardcoded secrets, API keys, tokens, passwords
-- Exposed IP addresses or internal network details
-- Insecure HTTP endpoints, CORS misconfigurations
-- Dangerous shell commands or injection vectors
-- Known vulnerable dependencies
-- Overly permissive permissions
-
-**Severity-based response:**
-- **Low / Medium** → Auto-fix with CLI, then push
-- **High** → Revert all changes, block push
-
-Reviews are saved in `security-reviews/`.
+See `CLAUDE.md` for the full API reference.
 
 ## Architecture
 
 ```
 Task-Claw/
-├── task-claw.py          # Main agent
+├── task-claw.py          # Entire agent (single file)
+├── web/                  # Self-contained web UI
+│   ├── index.html        # Tasks + Ideas page
+│   ├── pipeline.html     # Pipeline monitor + config
+│   ├── css/              # Stylesheets
+│   └── js/               # Client-side JS
 ├── providers.json        # CLI provider definitions
+├── pipeline.json         # Pipeline stage + PM config
+├── prompts.json          # Externalized prompt templates
+├── skills.json           # User-defined skills
 ├── .env                  # Config + secrets (not committed)
 ├── .env.example          # Template
 ├── Start-TaskClaw.bat    # Windows launcher
+├── data/                 # Auto-created, gitignored
+│   ├── tasks.json        # Task queue
+│   ├── ideas.json        # Idea queue
+│   └── photos/           # Uploaded images
 ├── agent-state.json      # Runtime state (auto-generated)
-├── agent.log             # Logs
-├── security-reviews/     # Security audit reports
-└── research-output/      # Research results
+├── agent.log             # Rolling log
+├── security-reviews/     # Per-task security audit reports
+├── pipeline-output/      # Stage outputs per run
+├── skill-output/         # Skill execution results
+└── test_pipeline.py      # Unit tests
 ```
+
+## Testing
+
+```bash
+python -m unittest test_pipeline -v       # unit tests
+python -m unittest test_e2e -v            # E2E tests with mocks
+```
+
+## Security
+
+- Optional `API_KEY` env var gates all mutating endpoints
+- `CORS_ORIGIN` restricts cross-origin requests
+- Path traversal protection on all file-serving endpoints
+- Request body size limits (2 MB)
+- Security review stage blocks HIGH severity findings from being pushed

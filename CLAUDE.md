@@ -111,7 +111,8 @@ Key env vars:
 | `PROJECT_DIR` | agent dir | Target project the agent edits |
 | `TASKS_FILE` | `data/tasks.json` | Task queue |
 | `IDEAS_FILE` | `data/ideas.json` | Idea queue |
-| `GITHUB_TOKEN` | — | Required for GitHub Models PM backend + git push |
+| `GITHUB_TOKEN` | — | For `github_models` PM backend + git push |
+| `ANTHROPIC_API_KEY` | — | For `anthropic` PM backend |
 | `CLI_PROVIDER` | `claude` | Default CLI provider |
 | `AGENT_POLL_INTERVAL` | `3600` | Seconds between poll cycles |
 | `AGENT_MAX_CALLS` | `10` | Daily API call cap |
@@ -119,6 +120,7 @@ Key env vars:
 | `PIPELINE_FILE` | `pipeline.json` | Pipeline + PM config |
 | `PIPELINE_MANAGER_TIMEOUT` | `300` | PM API call timeout (seconds) |
 | `PIPELINE_MAX_REVISE` | `1` | Max times PM can send a stage back for rework |
+| `RESTART_SERVICE_MAP` | — | Post-deploy docker restarts, e.g. `web/:web,api/:api` |
 
 ## HTTP API
 

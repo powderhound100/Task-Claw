@@ -4,6 +4,7 @@
     "model": "gpt-4o",
     "max_tokens": 4096,
     "temperature": 0.3,
+    "extract_requirements": false,
     "note": "Backends: 'github_models' (uses GITHUB_TOKEN), 'anthropic' (uses ANTHROPIC_API_KEY), 'openai_compatible' (set PIPELINE_PM_URL)"
   },
   "stages": {
@@ -47,5 +48,10 @@
     "enabled": true,
     "auto_push": true,
     "block_on_severity": "high"
+  },
+  "hooks": {
+    "on_stage_start": [],
+    "on_stage_end": [],
+    "on_verdict": []
   }
 }
