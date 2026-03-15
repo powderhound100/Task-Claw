@@ -515,5 +515,205 @@ function startPolling() {
     statusPollTimer = setTimeout(poll, 5000);
 }
 
+// -- Skills --
+
+let skillsData = [];
+let _skillRunId = null;
+
+async function fetchSkills() {
+    try {
+        const data = await api('/api/skills');
+        skillsData = data.skills || [];
+        renderSkillsList(skillsData);
+    } catch (e) {
+        console.warn('Skills fetch failed:', e);
+    }
+}
+
+function renderSkillsList(skills) {
+    const el = document.getElementById('skillsList');
+    if (!el) return;
+    if (skills.length === 0) {
+        el.innerHTML = '<div class="empty-state">No skills defined. Click "+ New Skill" to create one.</div>';
+        return;
+    }
+
+    let html = '';
+    skills.forEach(skill => {
+        const isEnv = skill.source === 'environment';
+        const tags = (skill.tags || []).map(t => '<span class="skill-tag">' + escHtml(t) + '</span>').join('');
+        html += '<div class="card skill-card' + (isEnv ? ' env-skill' : '') + '">';
+        html += '<div class="skill-card-header">';
+        html += '<h4>' + escHtml(skill.name || skill.id) + '</h4>';
+        if (isEnv) {
+            html += '<span class="skill-source-badge">env</span>';
+        }
+        html += '</div>';
+        if (skill.description) {
+            html += '<p class="text-muted text-sm">' + escHtml(skill.description) + '</p>';
+        }
+        html += '<div class="skill-meta">';
+        html += '<span class="skill-phase">' + escHtml(skill.phase || 'implement') + '</span>';
+        if (skill.provider) {
+            html += '<span class="skill-provider">' + escHtml(skill.provider) + '</span>';
+        }
+        if (tags) html += '<div class="skill-tags">' + tags + '</div>';
+        html += '</div>';
+        html += '<div class="skill-actions mt-8">';
+        html += '<button class="btn btn-primary btn-sm" onclick="showSkillRunModal(\'' + escHtml(skill.id) + '\')">Run</button>';
+        if (!isEnv) {
+            html += '<button class="btn btn-secondary btn-sm" onclick="editSkill(\'' + escHtml(skill.id) + '\')">Edit</button>';
+            html += '<button class="btn btn-danger btn-sm" onclick="deleteSkill(\'' + escHtml(skill.id) + '\')">Delete</button>';
+        }
+        html += '</div>';
+        html += '</div>';
+    });
+    el.innerHTML = html;
+}
+
+function showSkillForm(editId) {
+    document.getElementById('skillForm').style.display = 'block';
+    document.getElementById('skillFormTitle').textContent = editId ? 'Edit Skill' : 'New Skill';
+    document.getElementById('skillEditId').value = editId || '';
+    if (!editId) {
+        document.getElementById('skillName').value = '';
+        document.getElementById('skillDesc').value = '';
+        document.getElementById('skillPrompt').value = '';
+        document.getElementById('skillPhase').value = 'implement';
+        document.getElementById('skillProvider').value = '';
+        document.getElementById('skillTags').value = '';
+    }
+}
+
+function hideSkillForm() {
+    document.getElementById('skillForm').style.display = 'none';
+}
+
+function editSkill(skillId) {
+    const skill = skillsData.find(s => s.id === skillId);
+    if (!skill) return;
+    showSkillForm(skillId);
+    document.getElementById('skillName').value = skill.name || '';
+    document.getElementById('skillDesc').value = skill.description || '';
+    document.getElementById('skillPrompt').value = skill.prompt || '';
+    document.getElementById('skillPhase').value = skill.phase || 'implement';
+    document.getElementById('skillProvider').value = skill.provider || '';
+    document.getElementById('skillTags').value = (skill.tags || []).join(', ');
+}
+
+async function saveSkill() {
+    const editId = document.getElementById('skillEditId').value;
+    const body = {
+        name: document.getElementById('skillName').value.trim(),
+        description: document.getElementById('skillDesc').value.trim(),
+        prompt: document.getElementById('skillPrompt').value.trim(),
+        phase: document.getElementById('skillPhase').value,
+        provider: document.getElementById('skillProvider').value.trim() || null,
+        tags: document.getElementById('skillTags').value.split(',').map(t => t.trim()).filter(Boolean),
+    };
+
+    if (!body.name || !body.prompt) {
+        alert('Name and prompt are required.');
+        return;
+    }
+
+    try {
+        if (editId) {
+            await api('/api/skills/' + editId, { method: 'PUT', body });
+        } else {
+            body.id = body.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+            await api('/api/skills', { method: 'POST', body });
+        }
+        hideSkillForm();
+        fetchSkills();
+    } catch (e) {
+        alert('Failed to save skill: ' + e.message);
+    }
+}
+
+async function deleteSkill(skillId) {
+    if (!confirm('Delete skill "' + skillId + '"?')) return;
+    try {
+        await api('/api/skills/' + skillId, { method: 'DELETE' });
+        fetchSkills();
+    } catch (e) {
+        alert('Failed to delete: ' + e.message);
+    }
+}
+
+function showSkillRunModal(skillId) {
+    const skill = skillsData.find(s => s.id === skillId);
+    if (!skill) return;
+    _skillRunId = skillId;
+    document.getElementById('skillRunModal').style.display = 'block';
+    document.getElementById('skillRunName').textContent = skill.name || skillId;
+    document.getElementById('skillRunInput').value = '';
+    document.getElementById('skillRunProvider').value = '';
+    document.getElementById('skillRunOutput').style.display = 'none';
+    document.getElementById('skillRunOutputText').textContent = '';
+}
+
+function hideSkillRunModal() {
+    document.getElementById('skillRunModal').style.display = 'none';
+    _skillRunId = null;
+}
+
+async function executeSkill() {
+    if (!_skillRunId) return;
+    const input = document.getElementById('skillRunInput').value.trim();
+    const provider = document.getElementById('skillRunProvider').value.trim() || undefined;
+    const outputEl = document.getElementById('skillRunOutput');
+    const textEl = document.getElementById('skillRunOutputText');
+
+    outputEl.style.display = 'block';
+    textEl.textContent = 'Running skill...';
+
+    try {
+        await api('/api/skills/' + _skillRunId + '/run', {
+            method: 'POST',
+            body: { input, provider },
+        });
+        textEl.textContent = 'Skill started. Output will appear when complete.\nPolling for results...';
+        pollSkillOutput(_skillRunId);
+    } catch (e) {
+        textEl.textContent = 'Error: ' + e.message;
+    }
+}
+
+async function pollSkillOutput(skillId) {
+    const textEl = document.getElementById('skillRunOutputText');
+    let attempts = 0;
+    const maxAttempts = 120; // 10 minutes at 5s intervals
+
+    async function check() {
+        attempts++;
+        try {
+            const data = await api('/api/skills/' + skillId + '/runs');
+            const runs = (data.runs || []).filter(r => r.status !== 'running');
+            if (runs.length > 0) {
+                const latest = runs[runs.length - 1];
+                const runId = latest.run_id;
+                try {
+                    const full = await api('/skill-output/' + runId);
+                    textEl.textContent = full.output || latest.output || 'No output';
+                } catch (_) {
+                    textEl.textContent = latest.output || 'Completed (no output captured)';
+                }
+                return;
+            }
+        } catch (e) {
+            // keep polling
+        }
+        if (attempts < maxAttempts) {
+            setTimeout(check, 5000);
+            textEl.textContent = 'Running skill... (' + (attempts * 5) + 's)';
+        } else {
+            textEl.textContent = 'Timed out waiting for skill output.';
+        }
+    }
+    setTimeout(check, 3000);
+}
+
 // -- Init --
 startPolling();
+fetchSkills();

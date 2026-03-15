@@ -61,6 +61,77 @@
             </div>
         </section>
 
+        <!-- Skills -->
+        <section class="pipeline-section">
+            <h2>Skills</h2>
+            <div class="skills-toolbar">
+                <button class="btn btn-primary" onclick="showSkillForm()">+ New Skill</button>
+            </div>
+            <div id="skillForm" class="card skill-form" style="display:none">
+                <h3 id="skillFormTitle">New Skill</h3>
+                <input type="hidden" id="skillEditId">
+                <div class="form-group">
+                    <label>Name</label>
+                    <input type="text" id="skillName" placeholder="e.g. Lint & Fix">
+                </div>
+                <div class="form-group">
+                    <label>Description</label>
+                    <input type="text" id="skillDesc" placeholder="What this skill does">
+                </div>
+                <div class="form-group">
+                    <label>Prompt Template <span class="text-muted text-sm">({input} replaced at runtime)</span></label>
+                    <textarea id="skillPrompt" rows="3" placeholder="Run git diff and..."></textarea>
+                </div>
+                <div class="grid-3">
+                    <div class="form-group">
+                        <label>Phase</label>
+                        <select id="skillPhase">
+                            <option value="implement">implement</option>
+                            <option value="plan">plan</option>
+                            <option value="test">test</option>
+                            <option value="review">review</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Provider <span class="text-muted text-sm">(blank = default)</span></label>
+                        <input type="text" id="skillProvider" placeholder="claude">
+                    </div>
+                    <div class="form-group">
+                        <label>Tags <span class="text-muted text-sm">(comma-separated)</span></label>
+                        <input type="text" id="skillTags" placeholder="quality, testing">
+                    </div>
+                </div>
+                <div class="form-actions mt-8">
+                    <button class="btn btn-primary" onclick="saveSkill()">Save Skill</button>
+                    <button class="btn btn-secondary" onclick="hideSkillForm()">Cancel</button>
+                </div>
+            </div>
+            <div id="skillsList" class="skills-grid mt-16">
+                <div class="empty-state">Loading skills...</div>
+            </div>
+
+            <!-- Skill Run Modal -->
+            <div id="skillRunModal" class="card skill-run-modal" style="display:none">
+                <h3>Run Skill: <span id="skillRunName"></span></h3>
+                <div class="form-group">
+                    <label>Input <span class="text-muted text-sm">(replaces {input} in prompt)</span></label>
+                    <textarea id="skillRunInput" rows="2" placeholder="Optional context or instructions..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Provider Override <span class="text-muted text-sm">(blank = skill default)</span></label>
+                    <input type="text" id="skillRunProvider" placeholder="">
+                </div>
+                <div class="form-actions mt-8">
+                    <button class="btn btn-primary" onclick="executeSkill()">Run</button>
+                    <button class="btn btn-secondary" onclick="hideSkillRunModal()">Cancel</button>
+                </div>
+                <div id="skillRunOutput" class="skill-run-output" style="display:none">
+                    <h4>Output</h4>
+                    <pre id="skillRunOutputText"></pre>
+                </div>
+            </div>
+        </section>
+
         <!-- Pipeline Configuration -->
         <section class="pipeline-section">
             <h2>Configuration</h2>
