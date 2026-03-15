@@ -599,5 +599,172 @@ class TestPipelineSecurityBlock(PipelineTestBase):
         self.assertIn("security", result.get("error", "").lower())
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  REQUIREMENTS EXTRACTION TESTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPmExtractRequirements(unittest.TestCase):
+    """Tests for _pm_extract_requirements()."""
+
+    def test_parses_numbered_requirements(self):
+        fake_response = (
+            "1. Add a /login endpoint that accepts POST with email and password\n"
+            "2. Return 401 when credentials are invalid\n"
+            "3. Return JWT token on successful login\n"
+            "4. Rate-limit login to 5 attempts per minute\n"
+        )
+        with patch.object(tc, "_pm_api_call", return_value=fake_response):
+            result = tc._pm_extract_requirements("Add login feature", {"backend": "github_models"})
+        self.assertEqual(len(result), 4)
+        self.assertIn("Add a /login endpoint", result[0])
+        self.assertIn("Rate-limit", result[3])
+
+    def test_empty_on_api_failure(self):
+        with patch.object(tc, "_pm_api_call", side_effect=Exception("API error")):
+            result = tc._pm_extract_requirements("Add login", {"backend": "github_models"})
+        self.assertEqual(result, [])
+
+    def test_empty_on_unparseable_response(self):
+        with patch.object(tc, "_pm_api_call", return_value="No numbered items here."):
+            result = tc._pm_extract_requirements("Add login", {"backend": "github_models"})
+        self.assertEqual(result, [])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PM OVERSEE STAGE — CHECKLIST / TRACEABILITY TESTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPmOverseeRequirements(unittest.TestCase):
+    """Tests that pm_oversee_stage injects checklist/traceability prompts."""
+
+    def test_plan_stage_injects_checklist(self):
+        """When requirements are provided for plan stage, checklist is injected into PM prompt."""
+        requirements = ["Add login endpoint", "Return 401 on bad credentials"]
+        captured_calls = []
+
+        def mock_api_call(system_msg, user_msg, pm_cfg, **kwargs):
+            captured_calls.append(user_msg)
+            return make_pm_response()
+
+        with patch.object(tc, "_pm_api_call", side_effect=mock_api_call):
+            tc.pm_oversee_stage(
+                "plan", "Add login", "", [("claude", GOOD_OUTPUT)],
+                {"backend": "github_models"}, requirements=requirements
+            )
+
+        self.assertEqual(len(captured_calls), 1)
+        self.assertIn("Requirements Checklist", captured_calls[0])
+        self.assertIn("Add login endpoint", captured_calls[0])
+        self.assertIn("COVERED", captured_calls[0])
+        self.assertIn("MISSING", captured_calls[0])
+
+    def test_plan_stage_no_checklist_without_requirements(self):
+        """When no requirements, no checklist injected."""
+        captured_calls = []
+
+        def mock_api_call(system_msg, user_msg, pm_cfg, **kwargs):
+            captured_calls.append(user_msg)
+            return make_pm_response()
+
+        with patch.object(tc, "_pm_api_call", side_effect=mock_api_call):
+            tc.pm_oversee_stage(
+                "plan", "Add login", "", [("claude", GOOD_OUTPUT)],
+                {"backend": "github_models"}
+            )
+
+        self.assertEqual(len(captured_calls), 1)
+        self.assertNotIn("Requirements Checklist", captured_calls[0])
+
+    def test_code_stage_injects_traceability(self):
+        """When code stage has plan context, traceability prompt is injected."""
+        context = "=== Plan stage output ===\n1. Edit main.py\n2. Add tests\n=== End plan ==="
+        captured_calls = []
+
+        def mock_api_call(system_msg, user_msg, pm_cfg, **kwargs):
+            captured_calls.append(user_msg)
+            return make_pm_response()
+
+        with patch.object(tc, "_pm_api_call", side_effect=mock_api_call):
+            tc.pm_oversee_stage(
+                "code", "Add login", context, [("claude", GOOD_OUTPUT)],
+                {"backend": "github_models"}
+            )
+
+        self.assertEqual(len(captured_calls), 1)
+        self.assertIn("Plan-to-Code Traceability", captured_calls[0])
+        self.assertIn("DONE", captured_calls[0])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HOOK TESTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestFireHooks(unittest.TestCase):
+    """Tests for _fire_hooks()."""
+
+    def test_no_hooks_returns_empty(self):
+        result = tc._fire_hooks("on_stage_start", {"task_id": "t1"}, {})
+        self.assertEqual(result, [])
+
+    def test_empty_hook_list(self):
+        cfg = {"hooks": {"on_stage_start": []}}
+        result = tc._fire_hooks("on_stage_start", {"task_id": "t1"}, cfg)
+        self.assertEqual(result, [])
+
+    def test_webhook_called_and_response_collected(self):
+        cfg = {"hooks": {"on_stage_start": [
+            {"type": "webhook", "url": "http://localhost:9999/test", "timeout": 2}
+        ]}}
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"inject_context": "extra info"}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            result = tc._fire_hooks("on_stage_start", {"task_id": "t1", "stage": "plan"}, cfg)
+
+        mock_post.assert_called_once()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["inject_context"], "extra info")
+
+    def test_hook_failure_does_not_raise(self):
+        cfg = {"hooks": {"on_stage_end": [
+            {"type": "webhook", "url": "http://localhost:9999/fail", "timeout": 1}
+        ]}}
+        with patch("requests.post", side_effect=Exception("Connection refused")):
+            result = tc._fire_hooks("on_stage_end", {"task_id": "t1"}, cfg)
+        self.assertEqual(result, [])
+
+    def test_non_webhook_type_ignored(self):
+        cfg = {"hooks": {"on_stage_start": [
+            {"type": "email", "address": "test@example.com"}
+        ]}}
+        result = tc._fire_hooks("on_stage_start", {"task_id": "t1"}, cfg)
+        self.assertEqual(result, [])
+
+    def test_verdict_override_payload(self):
+        """Hooks can return override_verdict in response."""
+        cfg = {"hooks": {"on_verdict": [
+            {"type": "webhook", "url": "http://localhost:9999/verdict",
+             "timeout": 2, "can_override": True}
+        ]}}
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"override_verdict": "revise"}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("requests.post", return_value=mock_resp):
+            result = tc._fire_hooks("on_verdict", {
+                "task_id": "t1", "stage": "plan", "verdict": "approve",
+                "issues": [], "attempt": 0, "max_attempts": 2
+            }, cfg)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["override_verdict"], "revise")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ and pushes to production.
 
 Supported CLI providers are defined in providers.json.
 """
-AGENT_VERSION = "2026.03.13-v10"  # bump this to verify we're running the right code
+AGENT_VERSION = "2026.03.15-v11"  # bump this to verify we're running the right code
 
 import json
 import mimetypes
@@ -1925,12 +1925,14 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                         team_outputs, cross_reviews)
                 else:
                     pm_result = pm_oversee_stage(
-                        stage, original_prompt, context, team_outputs, pm_cfg
+                        stage, original_prompt, context, team_outputs, pm_cfg,
+                        requirements=extracted_requirements,
                     )
             else:
                 # ── Standard oversight for plan/test or single-agent code ───
                 pm_result = pm_oversee_stage(
-                    stage, original_prompt, context, team_outputs, pm_cfg
+                    stage, original_prompt, context, team_outputs, pm_cfg,
+                    requirements=extracted_requirements,
                 )
 
             # Track PM API success
@@ -2005,15 +2007,21 @@ def run_pipeline(prompt: str, task_id: str | None = None,
             clean_handoff = _clean_stage_output(pm_result['handoff'])
             context += f"\n\n=== {stage.capitalize()} stage output ===\n{clean_handoff}\n=== End {stage} ==="
             context = _cap_context(context)
-            elapsed = time.time() - _stage_start
+            elapsed = round(time.time() - _stage_start, 1)
             log.info("   ✅ Stage '%s' done in %.0fs — PM: %s", stage, elapsed, verdict.upper())
-            stage_log.append({"stage": stage, "elapsed": round(elapsed, 1),
+            stage_log.append({"stage": stage, "elapsed": elapsed,
                                "verdict": verdict, "issues": issues, "team": team,
                                "note": pm_result.get("handoff", "")[:200],
                                "output": pm_result.get("synthesis", "")[:2000],
                                "output_file": str(_stage_output_path(tid, stage))})
             with status_lock:
                 agent_status["stage_log"] = list(stage_log)
+            _fire_hooks("on_stage_end", {
+                "task_id": tid, "stage": stage,
+                "output_length": len(pm_result.get("full_response", "")),
+                "output_preview": pm_result.get("synthesis", "")[:500],
+                "elapsed": elapsed,
+            }, cfg)
             break
 
     # ── Publish ──────────────────────────────────────────────────────────────
