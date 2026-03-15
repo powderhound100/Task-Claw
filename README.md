@@ -131,7 +131,7 @@ After every implementation, a **fresh CLI instance** audits the git diff for:
 
 **Severity-based response:**
 - **Low / Medium** → Auto-fix with CLI, then push
-- **High** → Revert all changes, block push, notify user via Home Assistant
+- **High** → Revert all changes, block push
 
 Reviews are saved in `security-reviews/`.
 

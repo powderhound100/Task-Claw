@@ -156,6 +156,11 @@ The agent exposes an HTTP server on `AGENT_TRIGGER_PORT` (default 8099):
 | `/api/pipeline-stats` | GET | Per-stage stats (CLI calls, subagents, tools) |
 | `/api/config/pipeline` | GET/PUT | Read/write pipeline.json |
 | `/api/config/providers` | GET/PUT | Read/write providers.json |
+| `/api/skills` | GET/POST | List all skills (user + env) / create new skill |
+| `/api/skills/{id}` | PUT/DELETE | Update / delete a user-defined skill |
+| `/api/skills/{id}/run` | POST | Execute a skill with `{"input":"..."}` |
+| `/api/skills/{id}/runs` | GET | List completed runs for a skill |
+| `/skill-output/{run_id}` | GET | View full output of a skill run |
 
 ## Task / Idea JSON Schema
 
@@ -174,6 +179,24 @@ python -m unittest test_pipeline.TestIsGarbageOutput -v  # single class
 ```
 
 `test_pipeline.py` uses `importlib` to import `task-claw.py` and `unittest.mock.patch.object` for mocking. Tests cover pure functions (garbage detection, failure detection, context capping, prompt building, provider commands, JSON parsing) and pipeline flow scenarios (happy path, PM failover, garbage retry, test-code loopback, publish gating, security blocking).
+
+## Custom Skills System
+
+Skills are named prompt templates executed through CLI providers. Two sources:
+
+1. **User-defined** (`skills.json`) — create/edit/delete via web UI or API
+2. **Environment-discovered** (`.claude/skills/*/SKILL.md`) — auto-detected, read-only in UI
+
+**Skill JSON schema** (in `skills.json`):
+- `name` — display name
+- `description` — what the skill does
+- `prompt` — template with optional `{input}` placeholder
+- `provider` — CLI provider override (null = use default)
+- `phase` — which provider phase args to use (`implement`, `plan`, `test`, `review`)
+- `tags` — categorization labels
+- `timeout` — execution timeout in seconds
+
+Skills are invoked via `POST /api/skills/{id}/run` with `{"input": "..."}`. Output is saved to `skill-output/{run_id}/output.md`. The web UI on `/pipeline.html` has a Skills section for management and execution.
 
 ## Claude Code Skills
 

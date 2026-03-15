@@ -1,0 +1,31 @@
+{
+  "skills": {
+    "lint-fix": {
+      "name": "Lint & Fix",
+      "description": "Run the project linter on recent changes and fix any issues",
+      "prompt": "Run git diff to see recent changes, then run the project linter and fix any issues found.",
+      "provider": null,
+      "timeout": 300,
+      "phase": "implement",
+      "tags": ["quality"]
+    },
+    "explain-diff": {
+      "name": "Explain Changes",
+      "description": "Summarize what recent git changes do in plain English",
+      "prompt": "Run git diff to see recent changes. Provide a clear, concise summary of what changed and why it matters. {input}",
+      "provider": null,
+      "timeout": 120,
+      "phase": "plan",
+      "tags": ["review"]
+    },
+    "write-tests": {
+      "name": "Write Tests",
+      "description": "Generate tests for recent code changes",
+      "prompt": "Run git diff to see recent changes. Write comprehensive tests for the changed code. Follow existing test patterns in the project. {input}",
+      "provider": null,
+      "timeout": 300,
+      "phase": "implement",
+      "tags": ["testing"]
+    }
+  }
+}

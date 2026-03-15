@@ -52,8 +52,6 @@ STATE_FILE    = AGENT_DIR / "agent-state.json"
 LOG_FILE      = AGENT_DIR / "agent.log"
 POLL_INTERVAL = int(os.environ.get("AGENT_POLL_INTERVAL", "3600"))
 GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
-HA_URL        = os.environ.get("HA_URL", "http://localhost:8123")
-HA_TOKEN      = os.environ.get("HA_TOKEN", "")
 TRIGGER_PORT  = int(os.environ.get("AGENT_TRIGGER_PORT", "8099"))
 
 GITHUB_MODELS_URL = os.environ.get("GITHUB_MODELS_URL",
@@ -176,6 +174,9 @@ def _get_stage_stats(stage_name: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 PROVIDERS_FILE = AGENT_DIR / "providers.json"
+SKILLS_FILE = AGENT_DIR / "skills.json"
+SKILLS_OUTPUT_DIR = AGENT_DIR / "skill-output"
+SKILLS_OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 def _load_json_file(path: Path, default: dict, label: str = "") -> dict:
@@ -231,6 +232,193 @@ def get_provider_for_phase(phase: str, task_override: str | None = None) -> dict
     env_key = env_map.get(phase, "CLI_PROVIDER")
     provider_name = os.environ.get(env_key) or os.environ.get("CLI_PROVIDER")
     return _get_provider(provider_name)
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SKILLS SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════
+
+_skills_lock = threading.Lock()
+_skill_runs: dict = {}  # {run_id: {status, skill_id, output, started, ...}}
+
+
+def _load_skills() -> dict:
+    """Load user-defined skills from skills.json."""
+    return _load_json_file(SKILLS_FILE, {"skills": {}}, "skills.json")
+
+
+def _save_skills(data: dict):
+    """Write skills config back to skills.json."""
+    SKILLS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _discover_env_skills() -> dict:
+    """
+    Auto-discover skills from .claude/skills/ directories in PROJECT_DIR.
+    Parses SKILL.md files for name, description, and instructions.
+    Returns dict of {skill_id: skill_definition}.
+    """
+    discovered = {}
+    skills_root = PROJECT_DIR / ".claude" / "skills"
+    if not skills_root.is_dir():
+        return discovered
+
+    for skill_dir in skills_root.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        skill_file = skill_dir / "SKILL.md"
+        if not skill_file.exists():
+            continue
+        try:
+            text = skill_file.read_text(encoding="utf-8")
+            # Parse name from first heading
+            name_match = re.search(r"^#\s+(.+)", text, re.MULTILINE)
+            name = name_match.group(1).strip() if name_match else skill_dir.name
+
+            # Parse description from ## Description section
+            desc_match = re.search(
+                r"## Description\n+(.+?)(?=\n##|\Z)", text, re.DOTALL
+            )
+            description = desc_match.group(1).strip().split("\n")[0] if desc_match else ""
+
+            # Parse triggers
+            triggers = []
+            trig_match = re.search(
+                r"## Triggers\n+(.+?)(?=\n##|\Z)", text, re.DOTALL
+            )
+            if trig_match:
+                for line in trig_match.group(1).strip().splitlines():
+                    line = line.strip().lstrip("- ").strip('"')
+                    if line:
+                        triggers.append(line)
+
+            skill_id = f"env:{skill_dir.name}"
+            discovered[skill_id] = {
+                "name": name,
+                "description": description,
+                "prompt": f"Follow the instructions in {skill_file} to complete this task. {{input}}",
+                "provider": None,
+                "timeout": 300,
+                "phase": "implement",
+                "tags": ["environment"],
+                "source": "environment",
+                "triggers": triggers,
+                "skill_file": str(skill_file),
+            }
+        except Exception as e:
+            logging.warning("Could not parse skill %s: %s", skill_dir.name, e)
+
+    return discovered
+
+
+def get_all_skills() -> dict:
+    """Get merged dict of user-defined + environment-discovered skills."""
+    user_skills = _load_skills().get("skills", {})
+    env_skills = _discover_env_skills()
+    # User skills override env skills with same id
+    merged = {}
+    merged.update(env_skills)
+    merged.update(user_skills)
+    return merged
+
+
+def run_skill(skill_id: str, input_text: str = "",
+              provider_override: str | None = None) -> dict:
+    """
+    Execute a skill by running its prompt through a CLI provider.
+    Returns {"success": bool, "output": str, "run_id": str, "elapsed": float}.
+    """
+    all_skills = get_all_skills()
+    if skill_id not in all_skills:
+        return {"success": False, "output": f"Skill '{skill_id}' not found",
+                "run_id": "", "elapsed": 0}
+
+    skill = all_skills[skill_id]
+    run_id = f"skill-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+
+    # Build the final prompt
+    prompt_template = skill.get("prompt", "")
+    prompt = prompt_template.replace("{input}", input_text).strip()
+    if not prompt:
+        return {"success": False, "output": "Skill has no prompt template",
+                "run_id": run_id, "elapsed": 0}
+
+    phase = skill.get("phase", "implement")
+    provider_name = provider_override or skill.get("provider")
+    provider = get_provider_for_phase(phase, provider_name)
+
+    # Track the run
+    with _skills_lock:
+        _skill_runs[run_id] = {
+            "status": "running",
+            "skill_id": skill_id,
+            "skill_name": skill.get("name", skill_id),
+            "input": input_text[:200],
+            "started": datetime.now(timezone.utc).isoformat(),
+            "output": "",
+        }
+
+    log.info(">>> Skill '%s' started (run_id=%s, provider=%s)",
+             skill.get("name", skill_id), run_id, provider.get("name", "?"))
+
+    start = time.time()
+    try:
+        # Write prompt file for long prompts
+        prompt_file = None
+        if len(prompt) > _PROMPT_FILE_THRESHOLD:
+            out_dir = SKILLS_OUTPUT_DIR / run_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            prompt_file = out_dir / ".prompt.md"
+            prompt_file.write_text(prompt, encoding="utf-8")
+
+        success, output = run_cli_command(provider, phase, prompt,
+                                          prompt_file=prompt_file)
+        elapsed = round(time.time() - start, 1)
+
+        # Save output
+        out_dir = SKILLS_OUTPUT_DIR / run_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "output.md").write_text(output or "", encoding="utf-8")
+
+        with _skills_lock:
+            _skill_runs[run_id] = {
+                "status": "done" if success else "failed",
+                "skill_id": skill_id,
+                "skill_name": skill.get("name", skill_id),
+                "input": input_text[:200],
+                "started": _skill_runs[run_id]["started"],
+                "finished": datetime.now(timezone.utc).isoformat(),
+                "output": output[:500] if output else "",
+                "elapsed": elapsed,
+                "success": success,
+            }
+
+        log.info("<<< Skill '%s' %s in %.1fs (run_id=%s)",
+                 skill.get("name", skill_id),
+                 "succeeded" if success else "failed", elapsed, run_id)
+
+        return {"success": success, "output": output or "",
+                "run_id": run_id, "elapsed": elapsed}
+
+    except Exception as e:
+        elapsed = round(time.time() - start, 1)
+        log.error("Skill '%s' error: %s", skill_id, e)
+        with _skills_lock:
+            _skill_runs[run_id] = {
+                "status": "error",
+                "skill_id": skill_id,
+                "skill_name": skill.get("name", skill_id),
+                "input": input_text[:200],
+                "started": _skill_runs.get(run_id, {}).get("started", ""),
+                "finished": datetime.now(timezone.utc).isoformat(),
+                "output": str(e),
+                "elapsed": elapsed,
+                "success": False,
+            }
+        return {"success": False, "output": str(e),
+                "run_id": run_id, "elapsed": elapsed}
 
 
 def _write_prompt_file(prompt: str, task_id: str, stage: str, phase: str) -> Path:
@@ -1849,6 +2037,41 @@ class TriggerHandler(BaseHTTPRequestHandler):
         elif self.path.rstrip("/") == "/api/photos/upload":
             self._handle_photo_upload()
 
+        elif self.path.rstrip("/") == "/api/skills":
+            body = self._read_body()
+            if body is None:
+                return
+            skill_id = body.get("id") or generateId()
+            data = _load_skills()
+            skills = data.get("skills", {})
+            skills[skill_id] = {
+                "name": body.get("name", skill_id),
+                "description": body.get("description", ""),
+                "prompt": body.get("prompt", ""),
+                "provider": body.get("provider"),
+                "timeout": body.get("timeout", 300),
+                "phase": body.get("phase", "implement"),
+                "tags": body.get("tags", []),
+            }
+            data["skills"] = skills
+            _save_skills(data)
+            self._json(201, {"ok": True, "id": skill_id})
+
+        elif self.path.startswith("/api/skills/") and self.path.rstrip("/").endswith("/run"):
+            parts = self.path.split("/api/skills/", 1)[1].rstrip("/")
+            skill_id = parts.rsplit("/run", 1)[0]
+            body = self._read_body()
+            if body is None:
+                return
+            input_text = body.get("input", "")
+            provider_override = body.get("provider")
+            threading.Thread(
+                target=run_skill,
+                args=(skill_id, input_text, provider_override),
+                daemon=True,
+            ).start()
+            self._json(200, {"ok": True, "message": f"Skill '{skill_id}' started"})
+
         else:
             self._json(404, {"ok": False, "error": "Not found"})
 
@@ -1876,6 +2099,25 @@ class TriggerHandler(BaseHTTPRequestHandler):
             PROVIDERS_FILE.write_text(json.dumps(body, indent=2), encoding="utf-8")
             self._json(200, {"ok": True})
 
+        elif self.path.startswith("/api/skills/"):
+            skill_id = self.path.split("/api/skills/", 1)[1].rstrip("/")
+            body = self._read_body()
+            if body is None:
+                return
+            data = _load_skills()
+            skills = data.get("skills", {})
+            if skill_id not in skills:
+                self._json(404, {"ok": False, "error": "Skill not found"})
+                return
+            skills[skill_id].update({
+                k: body[k] for k in ("name", "description", "prompt", "provider",
+                                      "timeout", "phase", "tags")
+                if k in body
+            })
+            data["skills"] = skills
+            _save_skills(data)
+            self._json(200, {"ok": True})
+
         else:
             self._json(404, {"ok": False, "error": "Not found"})
 
@@ -1887,6 +2129,16 @@ class TriggerHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/ideas/"):
             item_id = self.path.split("/api/ideas/", 1)[1].rstrip("/")
             self._delete_item(item_id, load_ideas, save_ideas)
+
+        elif self.path.startswith("/api/skills/"):
+            skill_id = self.path.split("/api/skills/", 1)[1].rstrip("/")
+            data = _load_skills()
+            skills = data.get("skills", {})
+            if skill_id in skills:
+                del skills[skill_id]
+                data["skills"] = skills
+                _save_skills(data)
+            self._json(200, {"ok": True})
 
         elif self.path.startswith("/api/photos/"):
             filename = self.path.split("/api/photos/", 1)[1].rstrip("/")
@@ -1973,6 +2225,42 @@ class TriggerHandler(BaseHTTPRequestHandler):
 
         elif path.rstrip("/") == "/api/config/providers":
             self._json(200, _load_providers())
+
+        elif path.rstrip("/") == "/api/skills":
+            all_skills = get_all_skills()
+            result = []
+            for sid, skill in all_skills.items():
+                entry = dict(skill)
+                entry["id"] = sid
+                result.append(entry)
+            self._json(200, {"skills": result})
+
+        elif path.startswith("/api/skills/") and path.rstrip("/").endswith("/runs"):
+            skill_id = path.split("/api/skills/", 1)[1].rstrip("/").rsplit("/runs", 1)[0]
+            with _skills_lock:
+                runs = [
+                    dict(r, run_id=rid)
+                    for rid, r in _skill_runs.items()
+                    if r.get("skill_id") == skill_id
+                ]
+            self._json(200, {"runs": runs})
+
+        elif path.startswith("/skill-output/"):
+            run_id = path.split("/skill-output/", 1)[1].rstrip("/")
+            out_dir = SKILLS_OUTPUT_DIR / run_id
+            out_file = out_dir / "output.md"
+            if out_file.exists():
+                self._json(200, {"ok": True, "run_id": run_id,
+                                 "output": out_file.read_text(encoding="utf-8")})
+            else:
+                with _skills_lock:
+                    run = _skill_runs.get(run_id)
+                if run:
+                    self._json(200, {"ok": True, "run_id": run_id,
+                                     "status": run.get("status", "unknown"),
+                                     "output": run.get("output", "")})
+                else:
+                    self._json(404, {"ok": False, "error": "Skill run not found"})
 
         elif path.startswith("/research-status/"):
             idea_id = path.split("/research-status/", 1)[1].rstrip("/")
@@ -2268,25 +2556,6 @@ def call_gpt4o(system_prompt: str, user_prompt: str, state: dict) -> str | None:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  HOME ASSISTANT NOTIFICATIONS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def notify_ha(title: str, message: str):
-    if not HA_TOKEN:
-        log.info("(HA_TOKEN not set — skipping notification)")
-        return
-    try:
-        requests.post(
-            f"{HA_URL}/api/services/persistent_notification/create",
-            headers={"Authorization": f"Bearer {HA_TOKEN}"},
-            json={"title": title, "message": message},
-            timeout=5,
-        )
-        log.info("✅ Home Assistant notification sent")
-    except Exception as e:
-        log.warning("HA notification failed: %s", e)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  RESEARCH RUNNER
@@ -2393,8 +2662,6 @@ def launch_cli_implement(prompt: str, task_id: str, tasks: list,
         else:
             _update_task_status(task_id, tasks, "open",
                 f"CLI failed. Needs manual attention.\n{err_snippet}")
-        notify_ha(f"⚠️ {label.title()} needs you: {task_id}",
-                  f"CLI couldn't complete.\n\n{err_snippet}")
         return False
 
     _restart_changed_services()
@@ -2530,8 +2797,6 @@ def _handle_security_findings(review: dict, task_id: str, title: str,
         log.warning("🔒🚫 HIGH severity — blocking push!")
         txt = "\n".join(f"• [{f.get('severity','?').upper()}] {f.get('file','?')}: {f.get('issue','?')}"
                         for f in findings)
-        notify_ha(f"🚨 SECURITY BLOCK: {title}",
-                  f"High-severity issues in {label} {task_id}.\nNot pushed.\n\n{txt}")
         try:
             subprocess.run(["git", "reset", "HEAD", "--hard"],
                            cwd=str(PROJECT_DIR), capture_output=True, text=True, timeout=30)
@@ -2563,8 +2828,6 @@ def _handle_security_findings(review: dict, task_id: str, title: str,
         if r.returncode == 0:
             log.info("🔒✅ Security issues auto-fixed")
             txt = "\n".join(f"• {f.get('file','?')}: {f.get('issue','?')}" for f in findings)
-            notify_ha(f"🔒 Security fixes applied: {title}",
-                      f"Auto-fixed {len(findings)} issue(s).\n\n{txt}")
             return "fixed"
         else:
             log.warning("⚠️ Auto-fix failed (exit %d)", r.returncode)
@@ -2573,9 +2836,6 @@ def _handle_security_findings(review: dict, task_id: str, title: str,
     except Exception as e:
         log.warning("⚠️ Security auto-fix error: %s", e)
 
-    if medium:
-        notify_ha(f"⚠️ Security review: {title}",
-                  "Medium-severity issues found but auto-fix failed. Pushed anyway — review manually.")
     return "publish"
 
 
@@ -2689,8 +2949,6 @@ def _implement_planned_task(task_id: str, target: dict, collection: list,
         _update_idea_status(task_id, collection, "in-progress", "Manual implementation started")
     else:
         _update_task_status(task_id, collection, "in-progress", "Manual implementation started")
-    notify_ha(f"🚀 Implementing: {title}", f"Manual implementation triggered.\n\n**Plan:**\n{plan[:300]}")
-
     for item in collection:
         if item.get("id") == task_id:
             item["implementation_started_at"] = datetime.now().isoformat()
@@ -2713,14 +2971,12 @@ def _implement_planned_task(task_id: str, target: dict, collection: list,
             _update_idea_status(task_id, collection, status, "Manual implementation completed.")
         else:
             _update_task_status(task_id, collection, status, "Manual implementation completed.")
-        notify_ha(f"✅ Completed: {title}", f"Manual implementation successful!\n\n**Plan:**\n{plan[:300]}")
     else:
         err = result.get("error", "Pipeline failed")
         if is_idea:
             _update_idea_status(task_id, collection, "open", f"Implementation failed: {err}")
         else:
             _update_task_status(task_id, collection, "open", f"Implementation failed: {err}")
-        notify_ha(f"⚠️ Failed: {title}", f"Manual implementation error.\n\n{err}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2768,9 +3024,6 @@ def process_task(task: dict, tasks: list, state: dict):
     log.info("   Description: %s", desc[:200])
 
     _update_task_status(task_id, tasks, "grabbed", "Agent has picked up this task.")
-    notify_ha(f"🤖 Agent grabbed task: {title}",
-              f"Processing {task_type} (priority: {priority}).\nTask ID: {task_id}")
-
     # Description first — Claude works best when the task is front and center
     prompt = f"{title}: {desc}" if desc and desc != title else title
     photos = task.get("photos", [])
@@ -2812,13 +3065,10 @@ def process_task(task: dict, tasks: list, state: dict):
     if result["success"]:
         status = "pushed-to-production" if result["published"] else "done"
         _update_task_status(task_id, tasks, status, "Pipeline completed.")
-        notify_ha(f"✅ Task completed: {title}",
-                  f"Pipeline finished. Published: {result['published']}")
     else:
         err = result.get("error", "Pipeline failed")
         new_status = "security-blocked" if "security" in err.lower() else "open"
         _update_task_status(task_id, tasks, new_status, f"Pipeline failed: {err}")
-        notify_ha(f"❌ Task failed: {title}", err)
 
 
 def process_idea(idea: dict, ideas: list, state: dict):
@@ -2831,8 +3081,6 @@ def process_idea(idea: dict, ideas: list, state: dict):
     log.info("   ID: %s", idea_id)
 
     _update_idea_status(idea_id, ideas, "planning", "Agent is analyzing this idea.")
-    notify_ha(f"💡 Agent planning idea: {title}", f"Idea ID: {idea_id}")
-
     prompt = f"Idea: {title}\nDescription: {desc}"
     _update_idea_status(idea_id, ideas, "in-progress", "Pipeline started.")
     result = run_pipeline(prompt, task_id=idea_id)
@@ -2851,13 +3099,11 @@ def process_idea(idea: dict, ideas: list, state: dict):
     if result["success"]:
         status = "pushed-to-production" if result["published"] else "done"
         _update_idea_status(idea_id, ideas, status, "Pipeline completed.")
-        notify_ha(f"✅ Idea completed: {title}",
-                  f"Pipeline finished. Published: {result['published']}")
     else:
         err = result.get("error", "Pipeline failed")
         new_status = "security-blocked" if "security" in err.lower() else "open"
         _update_idea_status(idea_id, ideas, new_status, f"Pipeline failed: {err}")
-        notify_ha(f"❌ Idea failed: {title}", err)
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2883,7 +3129,6 @@ def main():
     log.info("   API cap:      %d calls/day", MAX_API_CALLS_PER_DAY)
     log.info("   Trigger port: %d", TRIGGER_PORT)
     log.info("   GitHub token: %s", "✅ set" if GITHUB_TOKEN else "❌ NOT SET")
-    log.info("   HA token:     %s", "✅ set" if HA_TOKEN else "❌ not set")
 
     providers = list_available_providers()
     default = os.environ.get("CLI_PROVIDER", _load_providers().get("default_provider", "copilot"))
