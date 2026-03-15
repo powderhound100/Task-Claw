@@ -25,6 +25,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from shutil import which
 
+import copy
 import concurrent.futures
 
 import requests
@@ -41,6 +42,18 @@ if ENV_FILE.exists():
             key, _, val = line.partition("=")
             os.environ.setdefault(key.strip(), val.strip())
 
+# ── Safe env helpers ─────────────────────────────────────────────────────────
+def _env_int(key: str, default: int) -> int:
+    """Read an env var as int with fallback on bad values."""
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        logging.warning("Invalid int for env var %s=%r — using default %d", key, raw, default)
+        return default
+
 # ── Config ──────────────────────────────────────────────────────────────────
 _project_dir_setting = Path(os.environ.get("PROJECT_DIR", str(AGENT_DIR)))
 PROJECT_DIR   = _project_dir_setting if _project_dir_setting.is_dir() else AGENT_DIR
@@ -50,18 +63,25 @@ TASKS_FILE    = Path(os.environ.get("TASKS_FILE", str(DATA_DIR / "tasks.json")))
 IDEAS_FILE    = Path(os.environ.get("IDEAS_FILE", str(DATA_DIR / "ideas.json")))
 STATE_FILE    = AGENT_DIR / "agent-state.json"
 LOG_FILE      = AGENT_DIR / "agent.log"
-POLL_INTERVAL = int(os.environ.get("AGENT_POLL_INTERVAL", "3600"))
+POLL_INTERVAL = _env_int("AGENT_POLL_INTERVAL", 3600)
 GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
-TRIGGER_PORT  = int(os.environ.get("AGENT_TRIGGER_PORT", "8099"))
+TRIGGER_PORT  = _env_int("AGENT_TRIGGER_PORT", 8099)
 
 GITHUB_MODELS_URL = os.environ.get("GITHUB_MODELS_URL",
                                     "https://models.inference.ai.azure.com/chat/completions")
 GITHUB_MODELS_MODEL = os.environ.get("GITHUB_MODELS_MODEL", "gpt-4o")
-MAX_API_CALLS_PER_DAY = int(os.environ.get("AGENT_MAX_CALLS", "10"))
+MAX_API_CALLS_PER_DAY = _env_int("AGENT_MAX_CALLS", 10)
 
 SESSION_DIR = Path(os.environ.get("AGENT_SESSION_DIR",
                                    str(Path.home() / ".copilot" / "session-state")))
 AUTO_IMPLEMENT_DEFAULT = os.environ.get("AGENT_AUTO_IMPLEMENT_DEFAULT", "true").lower() == "true"
+
+# ── Security config ──────────────────────────────────────────────────────────
+API_KEY = os.environ.get("API_KEY", "")
+CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "")  # empty = same-origin only
+ALLOWED_PROVIDER_BINARIES = {"claude", "gh", "copilot", "aider", "codex", "gemini", "q"}
+ALLOWED_PHOTO_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+_MAX_REQUEST_BODY = 2 * 1024 * 1024  # 2 MB
 
 # ── Runtime directories ─────────────────────────────────────────────────────
 DATA_DIR.mkdir(exist_ok=True)
@@ -522,7 +542,10 @@ def get_timeout(provider: dict, phase: str) -> int | None:
     for env_key in env_map.get(phase, ("COPILOT_TIMEOUT",)):
         env_val = os.environ.get(env_key)
         if env_val:
-            v = int(env_val)
+            try:
+                v = int(env_val)
+            except (ValueError, TypeError):
+                continue
             return None if v == 0 else v
 
     timeout_key = {
@@ -767,7 +790,7 @@ def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict,
     model = pm_cfg.get("model", "gpt-4o")
     max_tokens = pm_cfg.get("max_tokens", 4096)
     temperature = pm_cfg.get("temperature", 0.3)
-    pm_timeout = int(os.environ.get("PIPELINE_MANAGER_TIMEOUT", "300"))
+    pm_timeout = _env_int("PIPELINE_MANAGER_TIMEOUT", 300)
     last_err = None
 
     # Build request params based on backend
@@ -1299,9 +1322,9 @@ def _cap_context(context: str, max_chars: int = 12000) -> str:
     return "".join(sections)
 
 
-MAX_REVISE_ATTEMPTS = int(os.environ.get("PIPELINE_MAX_REVISE", "1"))
+MAX_REVISE_ATTEMPTS = _env_int("PIPELINE_MAX_REVISE", 1)
 MAX_TEST_FIX_ATTEMPTS = 1  # Single code-fix attempt after test failures
-PIPELINE_WALLCLOCK_TIMEOUT = int(os.environ.get("PIPELINE_WALLCLOCK_TIMEOUT", "3600"))  # seconds, 0=no limit
+PIPELINE_WALLCLOCK_TIMEOUT = _env_int("PIPELINE_WALLCLOCK_TIMEOUT", 3600)  # seconds, 0=no limit
 
 
 def _pm_health_check(pm_cfg: dict) -> bool:
@@ -1545,10 +1568,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                                "team": [], "note": "Aborted — pipeline ran too long"})
             break
 
-        _t = int(os.environ.get(
-            f"PIPELINE_{stage.upper()}_TIMEOUT",
-            str(stage_cfg.get("timeout", 300))
-        ))
+        _t = _env_int(f"PIPELINE_{stage.upper()}_TIMEOUT",
+                      stage_cfg.get("timeout", 300))
         timeout = None if _t == 0 else _t
         team = stage_cfg.get("team", ["claude"])
 
@@ -1676,8 +1697,8 @@ def run_pipeline(prompt: str, task_id: str | None = None,
                     log.warning("   🔄 Test found failures — looping back to code stage")
                     test_passed = False
                     code_team = stages_cfg.get("code", {}).get("team", ["claude"])
-                    code_timeout_val = int(os.environ.get("PIPELINE_CODE_TIMEOUT",
-                                          str(stages_cfg.get("code", {}).get("timeout", 300))))
+                    code_timeout_val = _env_int("PIPELINE_CODE_TIMEOUT",
+                                               stages_cfg.get("code", {}).get("timeout", 300))
                     code_timeout = None if code_timeout_val == 0 else code_timeout_val
                     test_failures = _extract_test_failures(combined)
                     fix_prompt = (
@@ -1878,6 +1899,9 @@ def run_pipeline(prompt: str, task_id: str | None = None,
 # ═══════════════════════════════════════════════════════════════════════════
 
 trigger_event = threading.Event()
+_file_io_lock = threading.Lock()        # B1/B5: guards tasks.json, ideas.json, agent-state.json
+_pipeline_semaphore = threading.Semaphore(2)  # S4: max concurrent pipelines
+
 agent_status = {
     "state": "starting",
     "current_task": None,
@@ -1917,9 +1941,20 @@ class TriggerHandler(BaseHTTPRequestHandler):
         log.debug("HTTP: " + fmt % args)
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = CORS_ORIGIN or f"http://localhost:{TRIGGER_PORT}"
+        self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+    def _check_auth(self) -> bool:
+        """Return True if request is authorized. Sends 401 and returns False otherwise."""
+        if not API_KEY:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if auth == f"Bearer {API_KEY}":
+            return True
+        self._json(401, {"ok": False, "error": "Unauthorized"})
+        return False
 
     def _json(self, code: int, data: dict):
         body = json.dumps(data).encode("utf-8")
@@ -1957,15 +1992,22 @@ class TriggerHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if not self._check_auth():
+            return
         if self.path.rstrip("/") == "/trigger":
             body = self._read_body()
             if body is None:
                 return
             prompt = body.get("prompt") if body else None
             if prompt:
+                if not _pipeline_semaphore.acquire(blocking=False):
+                    self._json(429, {"ok": False, "error": "Pipeline at capacity"})
+                    return
+                _pipeline_semaphore.release()  # release; _safe_pipeline_thread will re-acquire
                 log.info("🚨 Trigger with prompt — launching pipeline: %s", prompt[:100])
                 threading.Thread(
-                    target=run_pipeline, args=(prompt,), daemon=True
+                    target=_safe_pipeline_thread,
+                    args=(run_pipeline, prompt), daemon=True
                 ).start()
                 self._json(200, {"ok": True, "message": "Pipeline started!",
                                  "prompt": prompt[:100]})
@@ -1998,9 +2040,14 @@ class TriggerHandler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": "No plan found"})
                 return
             coll = ideas if is_idea else tasks
+            if not _pipeline_semaphore.acquire(blocking=False):
+                self._json(429, {"ok": False, "error": "Pipeline at capacity"})
+                return
+            _pipeline_semaphore.release()
             threading.Thread(
-                target=_implement_planned_task,
-                args=(resource_id, target, coll, is_idea, state),
+                target=_safe_pipeline_thread,
+                args=(_implement_planned_task, resource_id, target, coll, is_idea, state),
+                kwargs={"task_id": resource_id, "task_coll": coll, "is_idea": is_idea},
                 daemon=True,
             ).start()
             self._json(200, {"ok": True, "message": f"Implementation started for {target.get('title', resource_id)}!"})
@@ -2017,13 +2064,14 @@ class TriggerHandler(BaseHTTPRequestHandler):
                 if research_jobs.get(idea_id, {}).get("status") == "researching":
                     self._json(409, {"ok": False, "error": "Research already in progress"})
                     return
-            ideas = load_ideas()
-            for idea in ideas:
-                if idea.get("id") == idea_id:
-                    idea["research_status"] = "researching"
-                    idea["updated"] = _ts_ms()
-                    break
-            save_ideas(ideas)
+            with _file_io_lock:
+                ideas = load_ideas()
+                for idea in ideas:
+                    if idea.get("id") == idea_id:
+                        idea["research_status"] = "researching"
+                        idea["updated"] = _ts_ms()
+                        break
+                save_ideas(ideas)
             threading.Thread(target=run_research, args=(idea_id, title, desc), daemon=True).start()
             log.info("🔬 Research triggered for idea: %s", title)
             self._json(200, {"ok": True, "message": "Research started!"})
@@ -2076,6 +2124,8 @@ class TriggerHandler(BaseHTTPRequestHandler):
             self._json(404, {"ok": False, "error": "Not found"})
 
     def do_PUT(self):
+        if not self._check_auth():
+            return
         if self.path.startswith("/api/tasks/"):
             item_id = self.path.split("/api/tasks/", 1)[1].rstrip("/")
             self._update_item(item_id, load_tasks, save_tasks, "Task")
@@ -2088,6 +2138,9 @@ class TriggerHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             if body is None:
                 return
+            if not isinstance(body.get("stages"), dict):
+                self._json(400, {"ok": False, "error": "Pipeline config must have 'stages' dict"})
+                return
             pipeline_file = Path(os.environ.get("PIPELINE_FILE", str(AGENT_DIR / "pipeline.json")))
             pipeline_file.write_text(json.dumps(body, indent=2), encoding="utf-8")
             self._json(200, {"ok": True})
@@ -2096,6 +2149,21 @@ class TriggerHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             if body is None:
                 return
+            providers = body.get("providers")
+            if not isinstance(providers, dict):
+                self._json(400, {"ok": False, "error": "Must have 'providers' dict"})
+                return
+            for name, prov in providers.items():
+                if not isinstance(prov, dict) or "binary" not in prov:
+                    self._json(400, {"ok": False,
+                                     "error": f"Provider '{name}' missing 'binary'"})
+                    return
+                bin_stem = Path(prov["binary"]).stem.lower()
+                if bin_stem not in ALLOWED_PROVIDER_BINARIES:
+                    self._json(400, {"ok": False,
+                                     "error": f"Provider binary '{prov['binary']}' not allowed. "
+                                              f"Allowed: {', '.join(sorted(ALLOWED_PROVIDER_BINARIES))}"})
+                    return
             PROVIDERS_FILE.write_text(json.dumps(body, indent=2), encoding="utf-8")
             self._json(200, {"ok": True})
 
@@ -2122,6 +2190,8 @@ class TriggerHandler(BaseHTTPRequestHandler):
             self._json(404, {"ok": False, "error": "Not found"})
 
     def do_DELETE(self):
+        if not self._check_auth():
+            return
         if self.path.startswith("/api/tasks/"):
             item_id = self.path.split("/api/tasks/", 1)[1].rstrip("/")
             self._delete_item(item_id, load_tasks, save_tasks)
@@ -2173,14 +2243,13 @@ class TriggerHandler(BaseHTTPRequestHandler):
         # ── API endpoints ───────────────────────────────────────────────
         if path.rstrip("/") == "/status":
             with status_lock:
-                snap = dict(agent_status)
+                snap = copy.deepcopy(agent_status)
             snap["version"] = AGENT_VERSION
             providers_cfg = _load_providers()
             snap["providers"] = {k: v.get("name", k) for k, v in providers_cfg.get("providers", {}).items()}
             snap["default_provider"] = os.environ.get("CLI_PROVIDER",
                                         providers_cfg.get("default_provider", "claude"))
             snap["default_planning_backend"] = DEFAULT_PLANNING_BACKEND
-            snap["session_dir"] = str(SESSION_DIR)
             pipeline_cfg = load_pipeline()
             snap["pipeline_stages"] = {
                 name: {
@@ -2247,7 +2316,10 @@ class TriggerHandler(BaseHTTPRequestHandler):
 
         elif path.startswith("/skill-output/"):
             run_id = path.split("/skill-output/", 1)[1].rstrip("/")
-            out_dir = SKILLS_OUTPUT_DIR / run_id
+            out_dir = (SKILLS_OUTPUT_DIR / run_id).resolve()
+            if not out_dir.is_relative_to(SKILLS_OUTPUT_DIR.resolve()):
+                self._json(403, {"ok": False, "error": "Forbidden"})
+                return
             out_file = out_dir / "output.md"
             if out_file.exists():
                 self._json(200, {"ok": True, "run_id": run_id,
@@ -2272,12 +2344,16 @@ class TriggerHandler(BaseHTTPRequestHandler):
             parts = path.split("/pipeline-output/", 1)[1].rstrip("/").split("/", 1)
             task_id = parts[0]
             stage = parts[1] if len(parts) > 1 else None
-            task_dir = PIPELINE_OUTPUT_DIR / task_id
-            if not task_dir.exists():
+            task_dir = (PIPELINE_OUTPUT_DIR / task_id).resolve()
+            if not task_dir.is_relative_to(PIPELINE_OUTPUT_DIR.resolve()):
+                self._json(403, {"ok": False, "error": "Forbidden"})
+            elif not task_dir.exists():
                 self._json(404, {"ok": False, "error": "No pipeline output for this task"})
             elif stage:
-                out_file = task_dir / f"{stage}.md"
-                if out_file.exists():
+                out_file = (task_dir / f"{stage}.md").resolve()
+                if not out_file.is_relative_to(task_dir):
+                    self._json(403, {"ok": False, "error": "Forbidden"})
+                elif out_file.exists():
                     self._json(200, {"ok": True, "stage": stage,
                                      "content": out_file.read_text(encoding="utf-8")})
                 else:
@@ -2292,10 +2368,14 @@ class TriggerHandler(BaseHTTPRequestHandler):
         elif path.startswith("/security-report/"):
             task_id = path.split("/security-report/", 1)[1].rstrip("/")
             report_text = None
+            expected_stem = f"{task_id}-review"
             for candidate in SECURITY_REVIEW_DIR.iterdir():
-                if candidate.stem.startswith(task_id) or task_id in candidate.stem:
+                if candidate.stem == expected_stem or candidate.stem == task_id:
+                    resolved = candidate.resolve()
+                    if not resolved.is_relative_to(SECURITY_REVIEW_DIR.resolve()):
+                        break
                     try:
-                        report_text = candidate.read_text(encoding="utf-8")
+                        report_text = resolved.read_text(encoding="utf-8")
                     except Exception:
                         pass
                     break
@@ -2318,9 +2398,10 @@ class TriggerHandler(BaseHTTPRequestHandler):
         body.setdefault("created", _ts_ms())
         body.setdefault("updated", _ts_ms())
         body.setdefault("status", "open")
-        items = loader()
-        items.insert(0, body)
-        saver(items)
+        with _file_io_lock:
+            items = loader()
+            items.insert(0, body)
+            saver(items)
         self._json(201, body)
 
     def _update_item(self, item_id: str, loader, saver, label: str):
@@ -2328,26 +2409,35 @@ class TriggerHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         if body is None:
             return
-        items = loader()
-        for item in items:
-            if item.get("id") == item_id:
-                item.update(body)
-                item["updated"] = _ts_ms()
-                saver(items)
-                self._json(200, {"ok": True})
-                return
+        with _file_io_lock:
+            items = loader()
+            for item in items:
+                if item.get("id") == item_id:
+                    item.update(body)
+                    item["updated"] = _ts_ms()
+                    saver(items)
+                    self._json(200, {"ok": True})
+                    return
         self._json(404, {"ok": False, "error": f"{label} not found"})
 
     def _delete_item(self, item_id: str, loader, saver):
         """Delete a task or idea by ID."""
-        items = loader()
-        filtered = [i for i in items if i.get("id") != item_id]
-        if len(filtered) < len(items):
-            saver(filtered)
+        with _file_io_lock:
+            items = loader()
+            filtered = [i for i in items if i.get("id") != item_id]
+            if len(filtered) < len(items):
+                saver(filtered)
         self._json(200, {"ok": True})
 
     def _read_body(self) -> dict | None:
-        cl = int(self.headers.get("Content-Length", 0))
+        try:
+            cl = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            self._json(400, {"ok": False, "error": "Invalid Content-Length"})
+            return None
+        if cl > _MAX_REQUEST_BODY:
+            self._json(413, {"ok": False, "error": "Request body too large"})
+            return None
         raw = self.rfile.read(cl) if cl else b""
         try:
             return json.loads(raw) if raw else {}
@@ -2395,13 +2485,14 @@ class TriggerHandler(BaseHTTPRequestHandler):
                 file_data = file_data[:-2]
             if file_data.endswith(b"\r\n"):
                 file_data = file_data[:-2]
-            # Extract original filename for extension
+            # Extract original filename for extension (whitelist only)
             ext = ".jpg"
             for h in headers_raw.split("\r\n"):
                 if "filename=" in h:
                     fname = h.split("filename=", 1)[1].strip().strip('"')
                     if "." in fname:
-                        ext = "." + fname.rsplit(".", 1)[1].lower()
+                        candidate = "." + fname.rsplit(".", 1)[1].lower()
+                        ext = candidate if candidate in ALLOWED_PHOTO_EXT else ".jpg"
                     break
             # Save with uuid prefix
             safe_name = f"{uuid.uuid4().hex[:12]}{ext}"
@@ -2414,6 +2505,34 @@ class TriggerHandler(BaseHTTPRequestHandler):
 def generateId() -> str:
     """Generate a unique ID for tasks/ideas."""
     return f"{int(time.time() * 1000):x}-{uuid.uuid4().hex[:6]}"
+
+
+def _safe_pipeline_thread(target, *args, task_id: str = "", task_coll=None,
+                          is_idea: bool = False):
+    """Wrapper that catches pipeline crashes and resets agent state."""
+    if not _pipeline_semaphore.acquire(blocking=False):
+        log.warning("Pipeline semaphore full — rejecting concurrent run")
+        return
+    try:
+        target(*args)
+    except Exception as e:
+        log.error("Pipeline thread crashed: %s", e, exc_info=True)
+        with status_lock:
+            agent_status["state"] = "idle"
+            agent_status["stage_log"] = []
+            agent_status.pop("pipeline_started", None)
+        if task_id and task_coll is not None:
+            try:
+                if is_idea:
+                    _update_idea_status(task_id, task_coll, "open",
+                                        f"Pipeline crashed: {e}")
+                else:
+                    _update_task_status(task_id, task_coll, "open",
+                                        f"Pipeline crashed: {e}")
+            except Exception:
+                pass
+    finally:
+        _pipeline_semaphore.release()
 
 
 def start_trigger_server():
@@ -2453,20 +2572,22 @@ def _find_item(item_id: str, tasks: list, ideas: list) -> tuple[dict | None, boo
 
 # ── State I/O ───────────────────────────────────────────────────────────────
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            today = datetime.now().strftime("%Y-%m-%d")
-            if state.get("api_date") != today:
-                state["api_calls_today"] = 0
-                state["api_date"] = today
-            return state
-        except Exception:
-            pass
+    with _file_io_lock:
+        if STATE_FILE.exists():
+            try:
+                state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                today = datetime.now().strftime("%Y-%m-%d")
+                if state.get("api_date") != today:
+                    state["api_calls_today"] = 0
+                    state["api_date"] = today
+                return state
+            except Exception:
+                pass
     return {"processed": [], "api_calls_today": 0, "api_date": datetime.now().strftime("%Y-%m-%d")}
 
 def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    with _file_io_lock:
+        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 # ── Tasks / Ideas I/O ──────────────────────────────────────────────────────
@@ -2499,25 +2620,27 @@ def save_ideas(ideas: list):
 
 # ── Status helpers ──────────────────────────────────────────────────────────
 def _update_task_status(task_id: str, tasks: list, status: str, note: str):
-    for t in tasks:
-        if t.get("id") == task_id:
-            t["status"] = status
-            t["updated"] = _ts_ms()
-            if note:
-                t["ai_analysis"] = t.get("ai_analysis", "") + f"\n\n---\n**Agent note:** {note}"
-            break
-    save_tasks(tasks)
+    with _file_io_lock:
+        for t in tasks:
+            if t.get("id") == task_id:
+                t["status"] = status
+                t["updated"] = _ts_ms()
+                if note:
+                    t["ai_analysis"] = t.get("ai_analysis", "") + f"\n\n---\n**Agent note:** {note}"
+                break
+        save_tasks(tasks)
 
 def _update_idea_status(idea_id: str, ideas: list, status: str, note: str):
-    for i in ideas:
-        if i.get("id") == idea_id:
-            i["status"] = status
-            i["updated"] = _ts_ms()
-            if note:
-                existing = i.get("plan", "") or ""
-                i["plan"] = (existing + f"\n\n---\n**Agent note:** {note}") if existing else f"**Agent note:** {note}"
-            break
-    save_ideas(ideas)
+    with _file_io_lock:
+        for i in ideas:
+            if i.get("id") == idea_id:
+                i["status"] = status
+                i["updated"] = _ts_ms()
+                if note:
+                    existing = i.get("plan", "") or ""
+                    i["plan"] = (existing + f"\n\n---\n**Agent note:** {note}") if existing else f"**Agent note:** {note}"
+                break
+        save_ideas(ideas)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2592,15 +2715,16 @@ def run_research(idea_id: str, title: str, description: str):
         text = (output_file.read_text(encoding="utf-8") if output_file.exists()
                 else result.stdout.strip() if result.stdout else None)
         if text:
-            ideas = load_ideas()
-            for idea in ideas:
-                if idea.get("id") == idea_id:
-                    idea["research"] = text
-                    idea["research_status"] = "done"
-                    idea["researched_at"] = datetime.now().isoformat()
-                    idea["updated"] = _ts_ms()
-                    break
-            save_ideas(ideas)
+            with _file_io_lock:
+                ideas = load_ideas()
+                for idea in ideas:
+                    if idea.get("id") == idea_id:
+                        idea["research"] = text
+                        idea["research_status"] = "done"
+                        idea["researched_at"] = datetime.now().isoformat()
+                        idea["updated"] = _ts_ms()
+                        break
+                save_ideas(ideas)
             with research_lock:
                 research_jobs[idea_id] = {"status": "done", "result": text}
             log.info("✅ Research complete for idea: %s", title)
@@ -2608,13 +2732,14 @@ def run_research(idea_id: str, title: str, description: str):
             log.warning("⚠️ Research produced no output for: %s", title)
             with research_lock:
                 research_jobs[idea_id] = {"status": "error", "result": "No output."}
-            ideas = load_ideas()
-            for idea in ideas:
-                if idea.get("id") == idea_id:
-                    idea["research_status"] = "error"
-                    idea["updated"] = _ts_ms()
-                    break
-            save_ideas(ideas)
+            with _file_io_lock:
+                ideas = load_ideas()
+                for idea in ideas:
+                    if idea.get("id") == idea_id:
+                        idea["research_status"] = "error"
+                        idea["updated"] = _ts_ms()
+                        break
+                save_ideas(ideas)
     except subprocess.TimeoutExpired:
         log.error("⏰ Research timed out for: %s", title)
         with research_lock:
@@ -2910,9 +3035,11 @@ def _git_commit_and_push(task_id: str, title: str, label: str = "implementation"
             log.info("   No staged changes to commit")
             return True
 
+        safe_title = title.replace('\n', ' ').replace('\r', '')
+        safe_tid = task_id.replace('\n', ' ').replace('\r', '')
         backend_note = f"Backend: {backend}\n" if backend else ""
-        msg = (f"🤖 Agent [{label}]: {title}\n\n"
-               f"Task: {task_id}\n{backend_note}"
+        msg = (f"🤖 Agent [{label}]: {safe_title}\n\n"
+               f"Task: {safe_tid}\n{backend_note}"
                f"Automatically {label} by Task-Claw agent.\n\n"
                f"Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>")
         c = subprocess.run(["git", "commit", "-m", msg],
@@ -2949,21 +3076,23 @@ def _implement_planned_task(task_id: str, target: dict, collection: list,
         _update_idea_status(task_id, collection, "in-progress", "Manual implementation started")
     else:
         _update_task_status(task_id, collection, "in-progress", "Manual implementation started")
-    for item in collection:
-        if item.get("id") == task_id:
-            item["implementation_started_at"] = datetime.now().isoformat()
-            break
-    (save_ideas if is_idea else save_tasks)(collection)
+    with _file_io_lock:
+        for item in collection:
+            if item.get("id") == task_id:
+                item["implementation_started_at"] = datetime.now().isoformat()
+                break
+        (save_ideas if is_idea else save_tasks)(collection)
 
     # Start from code stage — the plan is already done, use it as context
     prompt = f"Implement the following plan for: {title}\n\n{plan}"
     result = run_pipeline(prompt, task_id=task_id, start_stage="code")
 
-    for item in collection:
-        if item.get("id") == task_id:
-            item["implementation_completed_at"] = datetime.now().isoformat()
-            break
-    (save_ideas if is_idea else save_tasks)(collection)
+    with _file_io_lock:
+        for item in collection:
+            if item.get("id") == task_id:
+                item["implementation_completed_at"] = datetime.now().isoformat()
+                break
+        (save_ideas if is_idea else save_tasks)(collection)
 
     if result["success"]:
         status = "pushed-to-production" if result["published"] else "done"
@@ -3043,24 +3172,25 @@ def process_task(task: dict, tasks: list, state: dict):
             if not f.name.startswith("."):
                 output_files[f.stem] = str(f)
 
-    for t in tasks:
-        if t.get("id") == task_id:
-            if plan_text:
-                t["plan"] = plan_text
-                t["planning_completed_at"] = datetime.now().isoformat()
-            t["implementation_completed_at"] = datetime.now().isoformat()
-            t["pipeline_summary"] = {
-                "stages": result.get("stage_log", []),
-                "elapsed": result.get("pipeline_elapsed", 0),
-                "published": result.get("published", False),
-                "success": result.get("success", False),
-                "ran_at": datetime.now().isoformat(),
-                "output_files": output_files,
-                "output_dir": str(task_output_dir),
-            }
-            t["updated"] = _ts_ms()
-            break
-    save_tasks(tasks)
+    with _file_io_lock:
+        for t in tasks:
+            if t.get("id") == task_id:
+                if plan_text:
+                    t["plan"] = plan_text
+                    t["planning_completed_at"] = datetime.now().isoformat()
+                t["implementation_completed_at"] = datetime.now().isoformat()
+                t["pipeline_summary"] = {
+                    "stages": result.get("stage_log", []),
+                    "elapsed": result.get("pipeline_elapsed", 0),
+                    "published": result.get("published", False),
+                    "success": result.get("success", False),
+                    "ran_at": datetime.now().isoformat(),
+                    "output_files": output_files,
+                    "output_dir": str(task_output_dir),
+                }
+                t["updated"] = _ts_ms()
+                break
+        save_tasks(tasks)
 
     if result["success"]:
         status = "pushed-to-production" if result["published"] else "done"
@@ -3086,15 +3216,16 @@ def process_idea(idea: dict, ideas: list, state: dict):
     result = run_pipeline(prompt, task_id=idea_id)
 
     plan_text = result.get("stage_results", {}).get("plan", "")
-    for i in ideas:
-        if i.get("id") == idea_id:
-            if plan_text:
-                i["plan"] = plan_text
-                i["planning_completed_at"] = datetime.now().isoformat()
-            i["implementation_completed_at"] = datetime.now().isoformat()
-            i["updated"] = _ts_ms()
-            break
-    save_ideas(ideas)
+    with _file_io_lock:
+        for i in ideas:
+            if i.get("id") == idea_id:
+                if plan_text:
+                    i["plan"] = plan_text
+                    i["planning_completed_at"] = datetime.now().isoformat()
+                i["implementation_completed_at"] = datetime.now().isoformat()
+                i["updated"] = _ts_ms()
+                break
+        save_ideas(ideas)
 
     if result["success"]:
         status = "pushed-to-production" if result["published"] else "done"
@@ -3155,7 +3286,7 @@ def main():
             with status_lock:
                 skip_age_filter = agent_status.pop("force_no_age_filter", False)
 
-            max_age_ms = int(os.environ.get("AGENT_MAX_TASK_AGE_HOURS", "8")) * 3600 * 1000
+            max_age_ms = _env_int("AGENT_MAX_TASK_AGE_HOURS", 8) * 3600 * 1000
             cutoff_ms = _ts_ms() - max_age_ms
 
             tasks = load_tasks()
