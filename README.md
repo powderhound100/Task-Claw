@@ -1,179 +1,216 @@
+<div align="center">
+
 # Task-Claw
 
-**A standalone, multi-provider autonomous coding agent** with a built-in web UI. It monitors a task queue, orchestrates a multi-stage pipeline (plan, code, test, review), runs security audits, and pushes to production — all from a single Python file.
+**Your backlog, on autopilot.**
 
-## Quick Start
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Single File](https://img.shields.io/badge/architecture-single%20file-orange.svg)](#architecture)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/powderhound100/Task-Claw/pulls)
 
-1. **Clone and configure:**
-   ```bash
-   git clone https://github.com/powderhound100/Task-Claw.git
-   cd Task-Claw
-   cp .env.example .env
-   # Edit .env — set at least one API key (GITHUB_TOKEN or ANTHROPIC_API_KEY)
-   ```
+Drop a task. Walk away. Task-Claw plans it, codes it, tests it, security-audits it, and pushes it to production.
 
-2. **Install dependency:**
-   ```bash
-   pip install requests
-   ```
+**One Python file. One dependency. Zero lock-in.**
 
-3. **Run:**
-   ```bash
-   python task-claw.py
-   # Or on Windows: Start-TaskClaw.bat
-   ```
+[Quick Start](#get-running-in-2-minutes) · [How It Works](#the-pipeline) · [Providers](#bring-any-ai--or-all-of-them) · [Web UI](#web-dashboard) · [API](#http-api)
 
-4. **Open the web UI:** `http://localhost:8099/`
+</div>
 
-## Web UI
+---
 
-Task-Claw includes a self-contained web interface (no external dependencies):
+## What Is This?
 
-- **Tasks page** (`/`) — Create, edit, delete tasks and ideas. Photo uploads, status filters, agent trigger button.
-- **Pipeline page** (`/pipeline.html`) — Live pipeline monitor, stage stats, run history, skills management, config editor.
+Task-Claw is a **fully autonomous multi-agent coding pipeline**. It uses AI coding tools you already have installed — Claude Code, GitHub Copilot, Aider, Codex, Gemini, Amazon Q — and orchestrates them through a PM-supervised pipeline that plans, implements, tests, reviews, and ships code without human intervention.
 
-## Pipeline
+**AI coding assistants are co-pilots. This is the pilot.**
 
-The multi-agent pipeline orchestrated by a Program Manager (PM):
+### Highlights
 
-```
-User Prompt
-    |
-[Rewrite] -- PM rewrites prompt for clarity
-    |
-[Plan]    -- PM directs team to plan, oversees quality
-    |                                  <- REVISE if needed
-[Code]    -- PM directs team to implement in parallel
-    |       -> cross-review -> PM deep-merge -> quality gate
-    |                                  <- REVISE if needed
-[Simplify]-- Review changed code for reuse, quality, efficiency
-    |
-[Test]    -- PM directs team to test, oversees results
-    |                                  <- REVISE if needed
-[Review]  -- Structured security audit -> PM verdict
-    |
-[Publish] -- git commit + push (blocked if HIGH severity)
-```
+- **PM-supervised pipeline** — An AI Program Manager rewrites vague requests into specs, directs agents, and quality-gates every stage. Work gets sent back for revision until it's actually good.
+- **Multi-agent code generation** — Two agents implement independently, cross-review each other, and the PM deep-merges the best of both.
+- **Self-healing tests** — If tests fail, the code stage re-runs automatically with targeted failure context.
+- **Security-first shipping** — Every change gets a structured security audit. HIGH severity findings block the push.
+- **Provider-agnostic** — Use one AI tool or mix them per stage. Add new providers in `providers.json` without touching code.
+- **Web dashboard included** — Task management, live pipeline monitoring, config editing. No Node, no build step.
 
-Run a one-shot pipeline from the CLI:
+---
+
+## Get Running in 2 Minutes
+
 ```bash
-python task-claw.py "Add a /health endpoint to the API"
+git clone https://github.com/powderhound100/Task-Claw.git
+cd Task-Claw
+cp .env.example .env          # Set at least one API key
+pip install requests           # The only dependency
+python task-claw.py            # Done
 ```
 
-Or trigger via HTTP:
+Open **http://localhost:8099** — you're looking at the dashboard.
+
+---
+
+## The Pipeline
+
+Describe what you want. Task-Claw handles the rest.
+
 ```bash
-curl -X POST http://localhost:8099/trigger -d '{"prompt":"Add a /health endpoint"}'
+python task-claw.py "Add a /health endpoint that returns uptime and version"
 ```
 
-## Supported CLI Providers
+```
+Your Prompt
+    ↓
+[Rewrite]  → PM sharpens the request
+[Plan]     → Team plans · PM quality-gates              ↺ REVISE
+[Code]     → Parallel implementation · cross-review      ↺ REVISE
+[Simplify] → Refactor for reuse, quality, efficiency
+[Test]     → Automated testing · failure loopback        ↺ REVISE
+[Review]   → Security audit (blocks HIGH severity)
+[Publish]  → git commit + push
+```
 
-| Provider | Binary | Notes |
-|----------|--------|-------|
-| **Claude Code** | `claude` | Anthropic (default) |
-| **GitHub Copilot CLI** | `gh copilot` | Requires `gh` CLI with copilot extension |
-| **Copilot (direct)** | `copilot` | Without `gh` wrapper |
+The PM doesn't rubber-stamp. It catches requirement gaps, scope drift, and quality issues — sending stages back for rework when needed.
+
+> **Three ways to trigger:**
+> CLI one-shot · Web UI button · `POST /trigger {"prompt":"..."}`
+
+---
+
+## Bring Any AI — Or All of Them
+
+| Provider | Command | |
+|----------|---------|---|
+| **Claude Code** | `claude` | Default |
+| **GitHub Copilot** | `gh copilot` | Via `gh` extension |
 | **Aider** | `aider` | Any LLM backend |
-| **OpenAI Codex CLI** | `codex` | OpenAI |
-| **Google Gemini CLI** | `gemini` | Google |
-| **Amazon Q Developer** | `q chat` | AWS |
+| **OpenAI Codex CLI** | `codex` | |
+| **Google Gemini CLI** | `gemini` | |
+| **Amazon Q Developer** | `q chat` | |
 
-Add your own providers in `providers.json` — no code changes needed.
-
-## Configuration
-
-### `.env` — Main config
+Mix and match per pipeline stage:
 
 ```env
-# At least one API key required for PM backend:
-GITHUB_TOKEN=ghp_...            # For 'github_models' PM backend + git push
-# ANTHROPIC_API_KEY=sk-ant-...  # For 'anthropic' PM backend
-
-# Project the agent manages (defaults to Task-Claw dir itself)
-# PROJECT_DIR=C:\MyProject
-
-CLI_PROVIDER=claude             # Default CLI provider
-AGENT_MAX_CALLS=10              # Daily PM API call cap
-AGENT_TRIGGER_PORT=8099         # Web UI + API port
+CLI_PLAN_PROVIDER=copilot
+CLI_IMPLEMENT_PROVIDER=claude
+CLI_TEST_PROVIDER=gemini
 ```
 
-See `.env.example` for all options.
+Or override per-task from the web UI. Add custom providers in `providers.json` — zero code changes.
 
-### Per-phase provider override
+---
 
-```env
-CLI_PLAN_PROVIDER=copilot       # Use Copilot for planning
-CLI_IMPLEMENT_PROVIDER=claude   # Use Claude Code for implementation
+## Web Dashboard
+
+Ships with a self-contained web UI. No npm. No bundler. Just open the browser.
+
+**Tasks page** (`/`) — Create, edit, and prioritize tasks and ideas. Photo uploads, status filters, one-click agent trigger.
+
+**Pipeline page** (`/pipeline.html`) — Live stage execution, run history, per-stage stats, skills management, config editing — all in-browser.
+
+<!-- Screenshots welcome! Add web UI screenshots here to dramatically improve conversion. -->
+
+---
+
+## Custom Skills
+
+Define reusable prompt templates and run them through any provider:
+
+```json
+{
+  "name": "explain-function",
+  "prompt": "Explain what this function does and suggest improvements:\n{input}",
+  "provider": "claude",
+  "phase": "implement"
+}
 ```
 
-### Per-task provider override
+Create in the web UI or via API. Every run saves full output history. Built-in skills include cost estimation, multi-provider comparison, and parallel pipeline orchestration.
 
-In the web UI or tasks.json, set `cli_provider` on individual tasks.
-
-### `pipeline.json` — Pipeline + PM config
-
-Configure PM backend (`github_models`, `anthropic`, or `openai_compatible`), enable/disable stages, set team members per stage, and control publish behavior.
-
-### `providers.json` — CLI provider definitions
-
-Each provider defines a binary, subcommands, and argument templates for each phase. Use `{prompt}` as a placeholder.
+---
 
 ## HTTP API
 
+Every UI feature is backed by a REST endpoint. Integrate Task-Claw into your existing workflow.
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/trigger` | POST | `{"prompt":"..."}` runs pipeline; no body wakes polling loop |
-| `/status` | GET | Agent state, version, provider list |
-| `/implement/{id}` | POST | Run pipeline from code stage for a planned task |
-| `/research` | POST | Start background research for an idea |
-| `/api/tasks` | GET/POST | List / create tasks |
-| `/api/ideas` | GET/POST | List / create ideas |
-| `/api/skills` | GET/POST | List / create skills |
-| `/api/pipeline-history` | GET | Completed pipeline runs |
-| `/api/config/pipeline` | GET/PUT | Read/write pipeline.json |
-| `/api/config/providers` | GET/PUT | Read/write providers.json |
+| `/trigger` | POST | Run pipeline from a prompt |
+| `/status` | GET | Agent state + provider list |
+| `/implement/{id}` | POST | Code stage for a planned task |
+| `/research` | POST | Background research on an idea |
+| `/api/tasks` | GET/POST | Task CRUD |
+| `/api/ideas` | GET/POST | Idea CRUD |
+| `/api/skills` | GET/POST | Skill CRUD + execution |
+| `/api/pipeline-history` | GET | Completed runs |
+| `/api/config/*` | GET/PUT | Live config editing |
 
-See `CLAUDE.md` for the full API reference.
+<details>
+<summary><strong>See full API reference</strong></summary>
+
+See [`CLAUDE.md`](CLAUDE.md) for complete endpoint documentation including research status polling, pipeline output viewing, security reports, photo management, and pipeline stats.
+
+</details>
+
+---
 
 ## Architecture
 
+One file. Seriously.
+
 ```
 Task-Claw/
-├── task-claw.py          # Entire agent (single file)
+├── task-claw.py          # The entire agent (~1100 lines)
 ├── web/                  # Self-contained web UI
-│   ├── index.html        # Tasks + Ideas page
-│   ├── pipeline.html     # Pipeline monitor + config
-│   ├── css/              # Stylesheets
-│   └── js/               # Client-side JS
 ├── providers.json        # CLI provider definitions
-├── pipeline.json         # Pipeline stage + PM config
-├── prompts.json          # Externalized prompt templates
+├── pipeline.json         # Pipeline + PM config
+├── prompts.json          # All prompt templates (editable)
 ├── skills.json           # User-defined skills
-├── .env                  # Config + secrets (not committed)
-├── .env.example          # Template
-├── Start-TaskClaw.bat    # Windows launcher
-├── data/                 # Auto-created, gitignored
-│   ├── tasks.json        # Task queue
-│   ├── ideas.json        # Idea queue
-│   └── photos/           # Uploaded images
-├── agent-state.json      # Runtime state (auto-generated)
-├── agent.log             # Rolling log
-├── security-reviews/     # Per-task security audit reports
-├── pipeline-output/      # Stage outputs per run
-├── skill-output/         # Skill execution results
-└── test_pipeline.py      # Unit tests
+├── .env                  # Your config (not committed)
+└── test_pipeline.py      # Unit + E2E tests
 ```
+
+No modules. No packages. No transpilation. Fork it, hack it, ship it.
+
+---
+
+## Configuration
+
+All config in `.env` ([see `.env.example`](.env.example)):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PROJECT_DIR` | agent dir | Project the agent edits |
+| `CLI_PROVIDER` | `claude` | Default coding tool |
+| `AGENT_MAX_CALLS` | `10` | Daily PM API call cap |
+| `AGENT_TRIGGER_PORT` | `8099` | Web UI + API port |
+| `PIPELINE_MAX_REVISE` | `1` | Max revision loops per stage |
+
+Pipeline stages, PM backend, team size, and publish behavior are configurable in `pipeline.json` — editable live from the web dashboard.
+
+---
+
+## Security
+
+- API key authentication for mutating endpoints
+- CORS origin restriction
+- Path traversal protection on all file routes
+- 2 MB request body limits
+- Security review stage blocks HIGH severity findings from production
 
 ## Testing
 
 ```bash
-python -m unittest test_pipeline -v       # unit tests
-python -m unittest test_e2e -v            # E2E tests with mocks
+python -m unittest test_pipeline -v   # Unit tests
+python -m unittest test_e2e -v        # E2E with mocks
 ```
 
-## Security
+---
 
-- Optional `API_KEY` env var gates all mutating endpoints
-- `CORS_ORIGIN` restricts cross-origin requests
-- Path traversal protection on all file-serving endpoints
-- Request body size limits (2 MB)
-- Security review stage blocks HIGH severity findings from being pushed
+<div align="center">
+
+**Built for developers who'd rather ship than babysit.**
+
+[Get Started](#get-running-in-2-minutes) · [Report a Bug](https://github.com/powderhound100/Task-Claw/issues) · [Contribute](https://github.com/powderhound100/Task-Claw/pulls)
+
+</div>
