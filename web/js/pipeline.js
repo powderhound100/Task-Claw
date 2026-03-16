@@ -394,26 +394,146 @@ async function loadProvidersConfig() {
     }
 }
 
+let _pipelineDirty = false;
+
+function markPipelineDirty() {
+    _pipelineDirty = true;
+    const bar = document.getElementById('pipelineSaveBar');
+    if (bar) bar.style.display = 'flex';
+}
+
 function renderPipelineStagesConfig(cfg) {
     const el = document.getElementById('pipelineStagesConfig');
     if (!el) return;
     const stages = cfg.stages || {};
-    let html = '<table class="pipeline-stats-table"><tr><th>Stage</th><th>Enabled</th><th>Team</th><th>Timeout</th></tr>';
+
+    let html = '';
     for (const [name, scfg] of Object.entries(stages)) {
-        html += '<tr>';
-        html += '<td><strong>' + escHtml(name) + '</strong></td>';
-        html += '<td>' + (scfg.enabled !== false ? 'Yes' : 'No') + '</td>';
-        html += '<td>' + escHtml((scfg.team || ['claude']).join(', ')) + '</td>';
-        html += '<td>' + (scfg.timeout || 300) + 's</td>';
-        html += '</tr>';
+        const enabled = scfg.enabled !== false;
+        const team = (scfg.team || ['claude']).join(', ');
+        const timeout = scfg.timeout || 300;
+
+        html += '<div class="stage-config-row' + (enabled ? '' : ' disabled') + '" data-stage="' + escHtml(name) + '">';
+        html += '<div class="stage-config-name">' + escHtml(name) + '</div>';
+
+        // Toggle switch
+        html += '<label class="toggle-switch">';
+        html += '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="toggleStage(\'' + escHtml(name) + '\', this.checked)">';
+        html += '<span class="toggle-slider"></span>';
+        html += '</label>';
+
+        // Team (editable)
+        html += '<div class="stage-config-field">';
+        html += '<label>Team</label>';
+        html += '<input type="text" class="inline-input" value="' + escHtml(team) + '" ';
+        html += 'onchange="updateStageField(\'' + escHtml(name) + '\', \'team\', this.value)" ';
+        html += 'placeholder="claude, copilot">';
+        html += '</div>';
+
+        // Timeout (editable)
+        html += '<div class="stage-config-field">';
+        html += '<label>Timeout</label>';
+        html += '<div class="timeout-input">';
+        html += '<input type="number" class="inline-input" value="' + timeout + '" min="30" max="3600" ';
+        html += 'onchange="updateStageField(\'' + escHtml(name) + '\', \'timeout\', parseInt(this.value))">';
+        html += '<span class="unit">s</span>';
+        html += '</div>';
+        html += '</div>';
+
+        html += '</div>';
     }
-    html += '</table>';
-    if (cfg.program_manager) {
-        const pm = cfg.program_manager;
-        html += '<div class="mt-8"><strong>PM Backend:</strong> ' + escHtml(pm.backend || 'github_models');
-        html += ' | <strong>Model:</strong> ' + escHtml(pm.model || 'gpt-4o') + '</div>';
-    }
+
     el.innerHTML = html;
+
+    // PM config
+    renderPmConfig(cfg);
+}
+
+function renderPmConfig(cfg) {
+    const el = document.getElementById('pmConfig');
+    if (!el || !cfg.program_manager) return;
+    const pm = cfg.program_manager;
+
+    let html = '<div class="pm-config-grid">';
+
+    // Backend selector
+    html += '<div class="stage-config-field">';
+    html += '<label>Backend</label>';
+    html += '<select class="inline-input" onchange="updatePmField(\'backend\', this.value)">';
+    ['github_models', 'anthropic', 'openai_compatible'].forEach(b => {
+        html += '<option value="' + b + '"' + (pm.backend === b ? ' selected' : '') + '>' + escHtml(b) + '</option>';
+    });
+    html += '</select>';
+    html += '</div>';
+
+    // Model
+    html += '<div class="stage-config-field">';
+    html += '<label>Model</label>';
+    html += '<input type="text" class="inline-input" value="' + escHtml(pm.model || 'gpt-4o') + '" ';
+    html += 'onchange="updatePmField(\'model\', this.value)">';
+    html += '</div>';
+
+    // Max tokens
+    html += '<div class="stage-config-field">';
+    html += '<label>Max Tokens</label>';
+    html += '<input type="number" class="inline-input" value="' + (pm.max_tokens || 4096) + '" ';
+    html += 'onchange="updatePmField(\'max_tokens\', parseInt(this.value))">';
+    html += '</div>';
+
+    // Temperature
+    html += '<div class="stage-config-field">';
+    html += '<label>Temperature</label>';
+    html += '<input type="number" class="inline-input" value="' + (pm.temperature || 0.3) + '" step="0.1" min="0" max="2" ';
+    html += 'onchange="updatePmField(\'temperature\', parseFloat(this.value))">';
+    html += '</div>';
+
+    html += '</div>';
+    el.innerHTML = html;
+}
+
+function toggleStage(name, enabled) {
+    if (!pipelineConfig || !pipelineConfig.stages[name]) return;
+    pipelineConfig.stages[name].enabled = enabled;
+    const row = document.querySelector('.stage-config-row[data-stage="' + name + '"]');
+    if (row) row.classList.toggle('disabled', !enabled);
+    markPipelineDirty();
+}
+
+function updateStageField(name, field, value) {
+    if (!pipelineConfig || !pipelineConfig.stages[name]) return;
+    if (field === 'team') {
+        pipelineConfig.stages[name].team = value.split(',').map(s => s.trim()).filter(Boolean);
+    } else {
+        pipelineConfig.stages[name][field] = value;
+    }
+    markPipelineDirty();
+}
+
+function updatePmField(field, value) {
+    if (!pipelineConfig || !pipelineConfig.program_manager) return;
+    pipelineConfig.program_manager[field] = value;
+    markPipelineDirty();
+}
+
+async function savePipelineConfig() {
+    try {
+        await api('/api/config/pipeline', { method: 'PUT', body: pipelineConfig });
+        _pipelineDirty = false;
+        document.getElementById('pipelineSaveBar').style.display = 'none';
+        showToast('Pipeline config saved!', 'success');
+        // Refresh the raw editor too
+        if (currentConfigTab === 'pipeline') {
+            document.getElementById('configEditor').value = JSON.stringify(pipelineConfig, null, 2);
+        }
+    } catch (e) {
+        showToast('Save failed: ' + e.message, 'error');
+    }
+}
+
+function resetPipelineConfig() {
+    _pipelineDirty = false;
+    document.getElementById('pipelineSaveBar').style.display = 'none';
+    loadPipelineConfig();
 }
 
 function renderProviderList(cfg) {

@@ -254,6 +254,184 @@
     font-weight: 600;
 }
 
+/* --- Interactive Stage Editor --- */
+.stages-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.stage-config-row {
+    display: grid;
+    grid-template-columns: 100px 50px 1fr 120px;
+    gap: 12px;
+    align-items: center;
+    padding: 10px 14px;
+    background: var(--bg);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    transition: opacity 0.2s, border-color 0.2s;
+}
+
+.stage-config-row:hover {
+    border-color: var(--accent);
+}
+
+.stage-config-row.disabled {
+    opacity: 0.45;
+}
+
+.stage-config-name {
+    font-weight: 600;
+    font-size: 0.88rem;
+    text-transform: capitalize;
+}
+
+.stage-config-field {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.stage-config-field label {
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.inline-input {
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 5px;
+    padding: 5px 8px;
+    font-size: 0.82rem;
+    font-family: inherit;
+    width: 100%;
+    transition: border-color 0.2s;
+}
+
+.inline-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.inline-input:hover {
+    border-color: var(--text-muted);
+}
+
+select.inline-input {
+    cursor: pointer;
+    appearance: auto;
+}
+
+.timeout-input {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.timeout-input .unit {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.timeout-input input {
+    width: 70px;
+}
+
+/* Toggle Switch */
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 38px;
+    height: 20px;
+    cursor: pointer;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-input);
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    transition: background 0.2s;
+}
+
+.toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    left: 2px;
+    bottom: 2px;
+    background: var(--text-muted);
+    border-radius: 50%;
+    transition: transform 0.2s, background 0.2s;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+    background: rgba(52, 211, 153, 0.2);
+    border-color: var(--success);
+}
+
+.toggle-switch input:checked + .toggle-slider::before {
+    transform: translateX(18px);
+    background: var(--success);
+}
+
+/* Save Bar */
+.config-save-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    padding: 10px 14px;
+    background: rgba(233, 69, 96, 0.08);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    animation: fadeInStage 0.2s ease-in;
+}
+
+.unsaved-label {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--accent);
+    margin-right: auto;
+}
+
+/* PM Editor */
+.pm-config-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 12px;
+}
+
+/* Advanced config toggle */
+.advanced-config {
+    margin-top: 0;
+}
+
+.advanced-config summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    padding: 8px 0;
+    user-select: none;
+}
+
+.advanced-config summary:hover {
+    color: var(--text);
+}
+
 /* --- Config Section --- */
 .config-section {
     margin-top: 16px;
@@ -379,6 +557,15 @@
     .stat-bar .bar-label {
         min-width: 60px;
         font-size: 0.72rem;
+    }
+
+    .stage-config-row {
+        grid-template-columns: 80px 50px 1fr;
+        gap: 8px;
+    }
+
+    .pm-config-grid {
+        grid-template-columns: 1fr 1fr;
     }
 }
 

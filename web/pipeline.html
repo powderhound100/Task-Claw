@@ -153,33 +153,49 @@
             </div>
         </section>
 
-        <!-- Pipeline Configuration -->
+        <!-- Pipeline Configuration (Interactive) -->
         <section class="pipeline-section">
-            <h2>Configuration</h2>
+            <h2>Pipeline Stages</h2>
             <div class="card config-section">
-                <h3>Pipeline Stages</h3>
-                <div id="pipelineStagesConfig" class="mt-8"></div>
-            </div>
-            <div class="card config-section mt-16">
-                <h3>Providers</h3>
-                <div id="providerList" class="provider-list mt-8"></div>
+                <div id="pipelineStagesConfig" class="stages-editor"></div>
+                <div class="config-save-bar" id="pipelineSaveBar" style="display:none">
+                    <span class="unsaved-label">Unsaved changes</span>
+                    <button class="btn btn-secondary btn-sm" onclick="resetPipelineConfig()">Discard</button>
+                    <button class="btn btn-primary btn-sm" onclick="savePipelineConfig()">Save</button>
+                </div>
             </div>
         </section>
 
-        <!-- Config Editor -->
+        <!-- PM Configuration -->
         <section class="pipeline-section">
-            <h2>Config Editor</h2>
-            <div class="card config-editor">
-                <div class="tabs">
-                    <div class="tab active" onclick="showConfigTab('pipeline', event)">pipeline.json</div>
-                    <div class="tab" onclick="showConfigTab('providers', event)">providers.json</div>
-                </div>
-                <textarea id="configEditor" spellcheck="false"></textarea>
-                <div class="form-actions mt-8">
-                    <button class="btn btn-primary" onclick="saveConfig()">Save</button>
-                    <button class="btn btn-secondary" onclick="loadCurrentConfig()">Reset</button>
-                </div>
+            <h2>Program Manager</h2>
+            <div class="card config-section">
+                <div id="pmConfig" class="pm-editor"></div>
             </div>
+        </section>
+
+        <!-- Providers -->
+        <section class="pipeline-section">
+            <h2>Providers</h2>
+            <div id="providerList" class="provider-list"></div>
+        </section>
+
+        <!-- Raw Config Editor (Advanced) -->
+        <section class="pipeline-section">
+            <details class="advanced-config">
+                <summary>Advanced: Raw JSON Editor</summary>
+                <div class="card config-editor mt-8">
+                    <div class="tabs">
+                        <div class="tab active" onclick="showConfigTab('pipeline', event)">pipeline.json</div>
+                        <div class="tab" onclick="showConfigTab('providers', event)">providers.json</div>
+                    </div>
+                    <textarea id="configEditor" spellcheck="false"></textarea>
+                    <div class="form-actions mt-8">
+                        <button class="btn btn-primary" onclick="saveConfig()">Save</button>
+                        <button class="btn btn-secondary" onclick="loadCurrentConfig()">Reset</button>
+                    </div>
+                </div>
+            </details>
         </section>
     </div>
 
