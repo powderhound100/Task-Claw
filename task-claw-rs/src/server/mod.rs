@@ -72,7 +72,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         // Static routes
-        .merge(routes_static::routes())
+        .merge(routes_static::routes(&state.config))
         // API routes
         .merge(routes_api::routes())
         // Pipeline routes

@@ -5,17 +5,19 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::path::PathBuf;
+use tower_http::services::ServeDir;
 
 use super::AppState;
+use crate::config::AppConfig;
 
-pub fn routes() -> Router<AppState> {
+pub fn routes(config: &AppConfig) -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(serve_index))
         .route("/index.html", axum::routing::get(serve_index))
         .route("/pipeline.html", axum::routing::get(serve_pipeline))
-        .route("/css/{*path}", axum::routing::get(serve_web_asset))
-        .route("/js/{*path}", axum::routing::get(serve_web_asset))
-        .route("/photos/{*path}", axum::routing::get(serve_photo))
+        .nest_service("/css", ServeDir::new(config.web_dir.join("css")))
+        .nest_service("/js", ServeDir::new(config.web_dir.join("js")))
+        .nest_service("/photos", ServeDir::new(config.photos_dir.clone()))
 }
 
 async fn serve_index(State(state): State<AppState>) -> Response {
@@ -28,24 +30,6 @@ async fn serve_pipeline(State(state): State<AppState>) -> Response {
         &state.config.web_dir,
     )
     .await
-}
-
-async fn serve_web_asset(
-    State(state): State<AppState>,
-    axum::extract::Path(path): axum::extract::Path<String>,
-) -> Response {
-    // Reconstruct the path from the URI since we get just the wildcard part
-    let uri_path = format!("{}", path);
-    let file_path = state.config.web_dir.join(&uri_path);
-    serve_file(&file_path, &state.config.web_dir).await
-}
-
-async fn serve_photo(
-    State(state): State<AppState>,
-    axum::extract::Path(path): axum::extract::Path<String>,
-) -> Response {
-    let file_path = state.config.photos_dir.join(&path);
-    serve_file(&file_path, &state.config.photos_dir).await
 }
 
 async fn serve_file(file_path: &PathBuf, allowed_root: &PathBuf) -> Response {

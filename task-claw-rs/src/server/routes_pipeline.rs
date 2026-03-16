@@ -21,7 +21,8 @@ pub fn routes() -> Router<AppState> {
         .route("/implement/{id}", axum::routing::post(implement))
         .route("/research", axum::routing::post(start_research))
         .route("/research-status/{id}", axum::routing::get(research_status))
-        .route("/pipeline-output/{*path}", axum::routing::get(pipeline_output))
+        .route("/pipeline-output/{task_id}", axum::routing::get(pipeline_output_list))
+        .route("/pipeline-output/{task_id}/{stage}", axum::routing::get(pipeline_output_stage))
         .route("/security-report/{id}", axum::routing::get(security_report))
         .route("/skill-output/{id}", axum::routing::get(skill_output))
 }
@@ -250,15 +251,11 @@ async fn research_status(
     Json(job)
 }
 
-async fn pipeline_output(
+async fn pipeline_output_list(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    Path(task_id): Path<String>,
 ) -> impl IntoResponse {
-    let parts: Vec<&str> = path.splitn(2, '/').collect();
-    let task_id = parts[0];
-    let stage = parts.get(1).copied();
-
-    let task_dir = state.config.pipeline_output_dir.join(task_id);
+    let task_dir = state.config.pipeline_output_dir.join(&task_id);
 
     // Path traversal guard
     if let Ok(resolved) = task_dir.canonicalize() {
@@ -273,32 +270,50 @@ async fn pipeline_output(
         return Json(json!({"ok": false, "error": "No pipeline output for this task"}));
     }
 
-    if let Some(stage) = stage {
-        let out_file = task_dir.join(format!("{}.md", stage));
-        if out_file.exists() {
-            match std::fs::read_to_string(&out_file) {
-                Ok(content) => Json(json!({"ok": true, "stage": stage, "content": content})),
-                Err(_) => Json(json!({"ok": false, "error": "Read error"})),
-            }
-        } else {
-            Json(json!({"ok": false, "error": format!("No output for stage '{}'", stage)}))
-        }
-    } else {
-        let mut files = serde_json::Map::new();
-        if let Ok(entries) = std::fs::read_dir(&task_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().map_or(false, |e| e == "md")
-                    && !entry.file_name().to_string_lossy().starts_with('.')
-                {
-                    if let Ok(content) = std::fs::read_to_string(&p) {
-                        let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                        files.insert(stem, json!(content));
-                    }
+    let mut files = serde_json::Map::new();
+    if let Ok(entries) = std::fs::read_dir(&task_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().map_or(false, |e| e == "md")
+                && !entry.file_name().to_string_lossy().starts_with('.')
+            {
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    files.insert(stem, json!(content));
                 }
             }
         }
-        Json(json!({"ok": true, "task_id": task_id, "stages": files}))
+    }
+    Json(json!({"ok": true, "task_id": task_id, "stages": files}))
+}
+
+async fn pipeline_output_stage(
+    State(state): State<AppState>,
+    Path((task_id, stage)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let task_dir = state.config.pipeline_output_dir.join(&task_id);
+
+    // Path traversal guard
+    if let Ok(resolved) = task_dir.canonicalize() {
+        if let Ok(root) = state.config.pipeline_output_dir.canonicalize() {
+            if !resolved.starts_with(&root) {
+                return Json(json!({"ok": false, "error": "Forbidden"}));
+            }
+        }
+    }
+
+    if !task_dir.exists() {
+        return Json(json!({"ok": false, "error": "No pipeline output for this task"}));
+    }
+
+    let out_file = task_dir.join(format!("{}.md", stage));
+    if out_file.exists() {
+        match std::fs::read_to_string(&out_file) {
+            Ok(content) => Json(json!({"ok": true, "stage": stage, "content": content})),
+            Err(_) => Json(json!({"ok": false, "error": "Read error"})),
+        }
+    } else {
+        Json(json!({"ok": false, "error": format!("No output for stage '{}'", stage)}))
     }
 }
 
