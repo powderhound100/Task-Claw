@@ -9,11 +9,11 @@
 [![Single File](https://img.shields.io/badge/architecture-single%20file-orange.svg)](#architecture)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/powderhound100/Task-Claw/pulls)
 
-Describe what you want. Task-Claw spins up an AI dev team — PM, parallel developers, QA, security reviewer — orchestrates them through a quality-gated pipeline, and ships when the code is actually ready.
+Describe what you want. Task-Claw spins up an AI dev team — PM, parallel developers, QA, security reviewer — orchestrates them through a quality-gated pipeline, and ships when the code is actually ready. Run it standalone, or **plug it into your personal agent** as a production-grade build backend.
 
 **One Python file. One dependency. Zero lock-in.**
 
-[Quick Start](#get-running-in-2-minutes) · [The Pipeline](#the-pipeline) · [Providers](#bring-any-ai--or-all-of-them) · [Web UI](#web-dashboard) · [API](#http-api) · [Full Pipeline Docs](docs/PIPELINE.md)
+[Quick Start](#get-running-in-2-minutes) · [Agent Interface](#plug-into-your-personal-agent) · [The Pipeline](#the-pipeline) · [Providers](#bring-any-ai--or-all-of-them) · [Web UI](#web-dashboard) · [API](#http-api) · [Full Pipeline Docs](docs/PIPELINE.md)
 
 </div>
 
@@ -38,6 +38,59 @@ Task-Claw gives you the workflow of a disciplined engineering org without the ov
 Task-Claw is a **fully autonomous multi-agent coding pipeline**. It uses AI coding tools you already have installed — Claude Code, GitHub Copilot, Aider, Codex, Gemini, Amazon Q — and orchestrates them through a PM-supervised pipeline that plans, implements, tests, reviews, and ships code without human intervention.
 
 **AI coding assistants are co-pilots. This is the engineering org.**
+
+---
+
+## Plug Into Your Personal Agent
+
+Task-Claw isn't just a standalone tool — it's a **build backend for your agent stack**. If you run a personal agent like [OpenClaw](https://github.com/anthropics/claw), a custom assistant, or any automation that needs to ship real code, point it at Task-Claw's agent interface and let the pipeline do the heavy lifting.
+
+```bash
+# Your agent calls one endpoint. Task-Claw handles the rest.
+curl -X POST http://localhost:8099/agent/build \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Add JWT auth to the API with refresh tokens", "wait": true}'
+```
+
+Your agent gets back structured results — not raw text, not markdown — a machine-readable response with stage verdicts, issues found, test outcomes, and a link to full outputs.
+
+**Why this matters:**
+
+- **Production-grade by default** — every feature your agent builds goes through plan → code → cross-review → test → security audit before it touches production. No shortcuts.
+- **Human control stays in the loop** — the PM quality-gates every stage. Security findings block pushes. You set the revision limits, the providers, the publish rules. Your agent proposes; the pipeline enforces.
+- **Sync or async** — `wait: true` blocks until done (your agent gets the result in one call). Or fire-and-forget with a `callback_url` and your agent gets notified when the build is ready.
+- **Self-describing** — `GET /agent/capabilities` tells your agent what operations exist, what skills are available, and how much capacity is free. Zero hardcoded knowledge needed.
+
+```json
+// POST /agent/build response
+{
+  "ok": true,
+  "status": "completed",
+  "result": {
+    "success": true,
+    "published": true,
+    "elapsed_seconds": 142.3,
+    "stages": [
+      {"name": "plan", "verdict": "approve", "issues": []},
+      {"name": "code", "verdict": "approve", "issues": []},
+      {"name": "test", "verdict": "approve", "issues": []},
+      {"name": "review", "verdict": "approve", "issues": []}
+    ],
+    "outputs_url": "/pipeline-output/aj-1710600000-a1b2c3"
+  }
+}
+```
+
+| Agent Endpoint | What Your Agent Does With It |
+|---|---|
+| `POST /agent/build` | "Build this feature" — full pipeline, structured result |
+| `POST /agent/plan` | "Plan this first" — get the plan back for review before committing to a build |
+| `POST /agent/skill` | Run a specific skill (lint, explain, compare providers) |
+| `GET /agent/capabilities` | Discover available operations, providers, skills, capacity |
+| `GET /agent/jobs/{id}` | Poll a running job for status and results |
+| `GET /agent/queue` | See what's running and what's pending |
+
+Task-Claw turns your personal agent from a vibe-coder into a vibe-coder **with an engineering team behind it**.
 
 ---
 
@@ -77,8 +130,8 @@ Your Prompt
 
 The PM doesn't just observe — it catches requirement gaps, scope drift, and quality shortfalls, sending stages back for rework before anything moves forward.
 
-> **Three ways to trigger:**
-> CLI one-shot · Web UI button · `POST /trigger {"prompt":"..."}`
+> **Four ways to trigger:**
+> CLI one-shot · Web UI button · `POST /trigger` · [Agent interface](#plug-into-your-personal-agent) (`POST /agent/build`)
 
 **[Full pipeline documentation →](docs/PIPELINE.md)** — every stage, every safety gate, every configuration knob.
 
@@ -138,7 +191,7 @@ Create in the web UI or via API. Every run saves full output history. Built-in s
 
 ## HTTP API
 
-Every UI feature is backed by a REST endpoint. Integrate Task-Claw into your existing workflow.
+Every UI feature is backed by a REST endpoint. The `/agent/` namespace is purpose-built for machine-to-machine integration ([details above](#plug-into-your-personal-agent)).
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -216,7 +269,7 @@ python -m unittest test_e2e -v        # E2E with mocks
 
 <div align="center">
 
-**Keep vibing. Task-Claw handles the engineering rigor.**
+**Keep vibing. Let your agent build. Task-Claw handles the engineering rigor.**
 
 [Get Started](#get-running-in-2-minutes) · [Report a Bug](https://github.com/powderhound100/Task-Claw/issues) · [Contribute](https://github.com/powderhound100/Task-Claw/pulls)
 
