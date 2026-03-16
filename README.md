@@ -2,20 +2,34 @@
 
 # Task-Claw
 
-**Your backlog, on autopilot.**
+**Vibe code. Ship like a senior engineering team.**
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Single File](https://img.shields.io/badge/architecture-single%20file-orange.svg)](#architecture)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/powderhound100/Task-Claw/pulls)
 
-Drop a task. Walk away. Task-Claw plans it, codes it, tests it, security-audits it, and pushes it to production.
+Describe what you want. Task-Claw spins up an AI dev team — PM, parallel developers, QA, security reviewer — orchestrates them through a quality-gated pipeline, and ships when the code is actually ready.
 
 **One Python file. One dependency. Zero lock-in.**
 
-[Quick Start](#get-running-in-2-minutes) · [How It Works](#the-pipeline) · [Providers](#bring-any-ai--or-all-of-them) · [Web UI](#web-dashboard) · [API](#http-api)
+[Quick Start](#get-running-in-2-minutes) · [The Pipeline](#the-pipeline) · [Providers](#bring-any-ai--or-all-of-them) · [Web UI](#web-dashboard) · [API](#http-api)
 
 </div>
+
+---
+
+## Built for vibe-coders who need production-grade guardrails
+
+You move fast. You describe features in plain English and expect working code. That's the right instinct — but shipping without a plan, code review, tests, or a security pass is how fast turns into fragile.
+
+Task-Claw gives you the workflow of a disciplined engineering org without the overhead of managing one:
+
+- **A PM that actually manages** — not a rubber-stamper. It rewrites vague requests into specs, directs the team, catches scope drift, and sends work back for revision until it meets the bar.
+- **A dev team that debates** — two agents implement independently and cross-review each other's code. The PM deep-merges the best of both.
+- **A QA loop that doesn't give up** — if tests fail, the code stage re-runs automatically with targeted failure context.
+- **A security reviewer that can block a push** — every change gets a structured audit. HIGH severity findings don't ship.
+- **Scales to the task** — one agent for a quick fix, a full team with cross-review and revision loops for complex features.
 
 ---
 
@@ -23,16 +37,7 @@ Drop a task. Walk away. Task-Claw plans it, codes it, tests it, security-audits 
 
 Task-Claw is a **fully autonomous multi-agent coding pipeline**. It uses AI coding tools you already have installed — Claude Code, GitHub Copilot, Aider, Codex, Gemini, Amazon Q — and orchestrates them through a PM-supervised pipeline that plans, implements, tests, reviews, and ships code without human intervention.
 
-**AI coding assistants are co-pilots. This is the pilot.**
-
-### Highlights
-
-- **PM-supervised pipeline** — An AI Program Manager rewrites vague requests into specs, directs agents, and quality-gates every stage. Work gets sent back for revision until it's actually good.
-- **Multi-agent code generation** — Two agents implement independently, cross-review each other, and the PM deep-merges the best of both.
-- **Self-healing tests** — If tests fail, the code stage re-runs automatically with targeted failure context.
-- **Security-first shipping** — Every change gets a structured security audit. HIGH severity findings block the push.
-- **Provider-agnostic** — Use one AI tool or mix them per stage. Add new providers in `providers.json` without touching code.
-- **Web dashboard included** — Task management, live pipeline monitoring, config editing. No Node, no build step.
+**AI coding assistants are co-pilots. This is the engineering org.**
 
 ---
 
@@ -52,7 +57,7 @@ Open **http://localhost:8099** — you're looking at the dashboard.
 
 ## The Pipeline
 
-Describe what you want. Task-Claw handles the rest.
+Describe what you want. Task-Claw assembles the team and runs the process.
 
 ```bash
 python task-claw.py "Add a /health endpoint that returns uptime and version"
@@ -61,16 +66,16 @@ python task-claw.py "Add a /health endpoint that returns uptime and version"
 ```
 Your Prompt
     ↓
-[Rewrite]  → PM sharpens the request
-[Plan]     → Team plans · PM quality-gates              ↺ REVISE
-[Code]     → Parallel implementation · cross-review      ↺ REVISE
+[Rewrite]  → PM sharpens the request into a clear spec
+[Plan]     → Team plans · PM quality-gates              ↺ REVISE if needed
+[Code]     → Parallel implementation · cross-review      ↺ REVISE if needed
 [Simplify] → Refactor for reuse, quality, efficiency
-[Test]     → Automated testing · failure loopback        ↺ REVISE
-[Review]   → Security audit (blocks HIGH severity)
+[Test]     → Automated testing · failure loopback        ↺ REVISE if needed
+[Review]   → Security audit · HIGH severity blocks push
 [Publish]  → git commit + push
 ```
 
-The PM doesn't rubber-stamp. It catches requirement gaps, scope drift, and quality issues — sending stages back for rework when needed.
+The PM doesn't just observe — it catches requirement gaps, scope drift, and quality shortfalls, sending stages back for rework before anything moves forward.
 
 > **Three ways to trigger:**
 > CLI one-shot · Web UI button · `POST /trigger {"prompt":"..."}`
@@ -88,7 +93,7 @@ The PM doesn't rubber-stamp. It catches requirement gaps, scope drift, and quali
 | **Google Gemini CLI** | `gemini` | |
 | **Amazon Q Developer** | `q chat` | |
 
-Mix and match per pipeline stage:
+Mix and match per pipeline stage — put your fastest model on planning, your strongest on implementation:
 
 ```env
 CLI_PLAN_PROVIDER=copilot
@@ -209,7 +214,7 @@ python -m unittest test_e2e -v        # E2E with mocks
 
 <div align="center">
 
-**Built for developers who'd rather ship than babysit.**
+**Keep vibing. Task-Claw handles the engineering rigor.**
 
 [Get Started](#get-running-in-2-minutes) · [Report a Bug](https://github.com/powderhound100/Task-Claw/issues) · [Contribute](https://github.com/powderhound100/Task-Claw/pulls)
 
