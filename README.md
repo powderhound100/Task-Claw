@@ -13,7 +13,7 @@ Describe what you want. Task-Claw spins up an AI dev team — PM, parallel devel
 
 **One Python file. One dependency. Zero lock-in.**
 
-[Quick Start](#get-running-in-2-minutes) · [The Pipeline](#the-pipeline) · [Providers](#bring-any-ai--or-all-of-them) · [Web UI](#web-dashboard) · [API](#http-api)
+[Quick Start](#get-running-in-2-minutes) · [The Pipeline](#the-pipeline) · [Providers](#bring-any-ai--or-all-of-them) · [Web UI](#web-dashboard) · [API](#http-api) · [Full Pipeline Docs](docs/PIPELINE.md)
 
 </div>
 
@@ -79,6 +79,8 @@ The PM doesn't just observe — it catches requirement gaps, scope drift, and qu
 
 > **Three ways to trigger:**
 > CLI one-shot · Web UI button · `POST /trigger {"prompt":"..."}`
+
+**[Full pipeline documentation →](docs/PIPELINE.md)** — every stage, every safety gate, every configuration knob.
 
 ---
 
