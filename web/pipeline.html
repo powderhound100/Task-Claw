@@ -4,13 +4,23 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Task-Claw - Pipeline</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M8 4c0 0-2 8 2 14M16 2c0 0-1 9 1 16M24 4c0 0 2 8-2 14' stroke='%23e94560' stroke-width='3' stroke-linecap='round' fill='none'/%3E%3Cpath d='M6 18c3 5 8 8 10 10 2-2 7-5 10-10' stroke='%23e94560' stroke-width='2.5' stroke-linecap='round' fill='none'/%3E%3C/svg%3E">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
     <link rel="stylesheet" href="/css/style.css">
     <link rel="stylesheet" href="/css/pipeline.css">
 </head>
 <body>
     <div class="container">
         <header class="header">
-            <h1>Task-Claw Pipeline</h1>
+            <div class="logo">
+                <svg class="logo-icon" viewBox="0 0 32 32" fill="none">
+                    <path d="M8 4c0 0-2 8 2 14M16 2c0 0-1 9 1 16M24 4c0 0 2 8-2 14" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                    <path d="M6 18c3 5 8 8 10 10 2-2 7-5 10-10" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                </svg>
+                <h1>Task<span>-Claw</span> Pipeline</h1>
+            </div>
             <nav>
                 <a href="/">Tasks</a>
                 <a href="/pipeline.html" class="active">Pipeline</a>
@@ -49,7 +59,11 @@
         <section class="pipeline-section">
             <h2>Stage Stats</h2>
             <div id="stageStats" class="stats-dashboard">
-                <div class="empty-state">No pipeline data yet</div>
+                <div class="empty-state">
+                    <svg class="empty-state-icon" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="10" cy="24" r="4"/><circle cx="24" cy="24" r="4"/><circle cx="38" cy="24" r="4"/><path d="M14 24h6M28 24h6"/></svg>
+                    <h4>No pipeline data yet</h4>
+                    <p>Run a task to see stage stats</p>
+                </div>
             </div>
         </section>
 
@@ -57,7 +71,11 @@
         <section class="pipeline-section">
             <h2>Pipeline History</h2>
             <div id="pipelineHistory">
-                <div class="empty-state">No completed runs</div>
+                <div class="empty-state">
+                    <svg class="empty-state-icon" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="24" cy="24" r="16"/><path d="M24 14v10l7 7"/><path d="M8 24H4M44 24h-4"/></svg>
+                    <h4>No completed runs</h4>
+                    <p>Pipeline history will appear here</p>
+                </div>
             </div>
         </section>
 
@@ -107,7 +125,10 @@
                 </div>
             </div>
             <div id="skillsList" class="skills-grid mt-16">
-                <div class="empty-state">Loading skills...</div>
+                <div class="empty-state">
+                    <svg class="empty-state-icon" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M28 6l-8 42M16 14L6 24l10 10M32 14l10 10-10 10"/></svg>
+                    <h4>Loading skills...</h4>
+                </div>
             </div>
 
             <!-- Skill Run Modal -->

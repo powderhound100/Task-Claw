@@ -273,7 +273,7 @@ function renderStageStats(data) {
     if (!el || !data || !data.stats) return;
     const stats = data.stats;
     if (Object.keys(stats).length === 0) {
-        el.innerHTML = '<div class="empty-state">No pipeline data yet</div>';
+        el.innerHTML = emptyState('pipeline', 'No pipeline data yet', 'Run a task to see stage stats');
         return;
     }
 
@@ -318,7 +318,7 @@ function renderPipelineHistory(data) {
     if (!el) return;
     const items = data.runs || [];
     if (items.length === 0) {
-        el.innerHTML = '<div class="empty-state">No completed runs</div>';
+        el.innerHTML = emptyState('history', 'No completed runs', 'Pipeline history will appear here');
         return;
     }
 
@@ -421,7 +421,7 @@ function renderProviderList(cfg) {
     if (!el) return;
     const providers = cfg.providers || {};
     if (Object.keys(providers).length === 0) {
-        el.innerHTML = '<div class="empty-state">No providers configured</div>';
+        el.innerHTML = emptyState('providers', 'No providers configured', 'Add providers in providers.json');
         return;
     }
     let html = '<div class="grid-3">';
@@ -462,7 +462,7 @@ async function saveConfig() {
     try {
         parsed = JSON.parse(editor.value);
     } catch (e) {
-        alert('Invalid JSON: ' + e.message);
+        showToast('Invalid JSON: ' + e.message, 'error');
         return;
     }
     try {
@@ -475,9 +475,9 @@ async function saveConfig() {
             providersConfig = parsed;
             renderProviderList(parsed);
         }
-        alert('Saved!');
+        showToast('Configuration saved!', 'success');
     } catch (e) {
-        alert('Save failed: ' + e.message);
+        showToast('Save failed: ' + e.message, 'error');
     }
 }
 
@@ -534,7 +534,7 @@ function renderSkillsList(skills) {
     const el = document.getElementById('skillsList');
     if (!el) return;
     if (skills.length === 0) {
-        el.innerHTML = '<div class="empty-state">No skills defined. Click "+ New Skill" to create one.</div>';
+        el.innerHTML = emptyState('skills', 'No skills defined', 'Click "+ New Skill" to create one');
         return;
     }
 
@@ -613,7 +613,7 @@ async function saveSkill() {
     };
 
     if (!body.name || !body.prompt) {
-        alert('Name and prompt are required.');
+        showToast('Name and prompt are required.', 'warning');
         return;
     }
 
@@ -627,17 +627,19 @@ async function saveSkill() {
         hideSkillForm();
         fetchSkills();
     } catch (e) {
-        alert('Failed to save skill: ' + e.message);
+        showToast('Failed to save skill: ' + e.message, 'error');
     }
 }
 
 async function deleteSkill(skillId) {
-    if (!confirm('Delete skill "' + skillId + '"?')) return;
+    const confirmed = await showConfirm('Delete skill "' + skillId + '"?');
+    if (!confirmed) return;
     try {
         await api('/api/skills/' + skillId, { method: 'DELETE' });
         fetchSkills();
+        showToast('Skill deleted', 'success');
     } catch (e) {
-        alert('Failed to delete: ' + e.message);
+        showToast('Failed to delete: ' + e.message, 'error');
     }
 }
 

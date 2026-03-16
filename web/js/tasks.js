@@ -152,7 +152,7 @@ function renderTasks() {
     const items = getFilteredItems();
 
     if (items.length === 0) {
-        container.innerHTML = '<div class="empty-state">No tasks found</div>';
+        container.innerHTML = emptyState('tasks', 'No tasks found', 'Create a task to get started');
         return;
     }
 
@@ -190,7 +190,7 @@ function renderIdeas() {
     const items = getFilteredItems();
 
     if (items.length === 0) {
-        container.innerHTML = '<div class="empty-state">No ideas found</div>';
+        container.innerHTML = emptyState('ideas', 'No ideas yet', 'Add an idea to explore');
         return;
     }
 
@@ -320,7 +320,7 @@ async function submitTask(e) {
             await loadIdeas();
             renderAll();
         } catch (e) {
-            alert('Failed to save idea: ' + e.message);
+            showToast('Failed to save idea: ' + e.message, 'error');
         }
         return;
     }
@@ -368,7 +368,7 @@ async function submitTask(e) {
         await loadTasks();
         renderAll();
     } catch (e) {
-        alert('Failed to save task: ' + e.message);
+        showToast('Failed to save task: ' + e.message, 'error');
     }
 }
 
@@ -441,7 +441,8 @@ async function toggleTaskDone(id) {
 }
 
 async function deleteTask(id, isIdea) {
-    if (!confirm('Delete this ' + (isIdea ? 'idea' : 'task') + '?')) return;
+    const confirmed = await showConfirm('Delete this ' + (isIdea ? 'idea' : 'task') + '?');
+    if (!confirmed) return;
     try {
         const path = isIdea ? '/api/ideas/' : '/api/tasks/';
         await api(path + id, { method: 'DELETE' });
@@ -449,24 +450,25 @@ async function deleteTask(id, isIdea) {
         else await loadTasks();
         closeTaskDetail();
         renderAll();
+        showToast((isIdea ? 'Idea' : 'Task') + ' deleted', 'success');
     } catch (e) {
-        alert('Delete failed: ' + e.message);
+        showToast('Delete failed: ' + e.message, 'error');
     }
 }
 
 async function implementTask(id) {
     try {
         await api('/implement/' + id, { method: 'POST' });
-        alert('Implementation started!');
+        showToast('Implementation started!', 'success');
     } catch (e) {
         // Try via trigger
         const task = tasks.find(t => t.id === id);
         if (task) {
             try {
                 await api('/trigger', { method: 'POST', body: { prompt: task.title + ': ' + (task.description || '') } });
-                alert('Pipeline triggered!');
+                showToast('Pipeline triggered!', 'success');
             } catch (e2) {
-                alert('Failed: ' + e2.message);
+                showToast('Failed: ' + e2.message, 'error');
             }
         }
     }
@@ -477,9 +479,9 @@ async function startResearch(id) {
     if (!idea) return;
     try {
         await api('/research', { method: 'POST', body: { id, title: idea.title, description: idea.description || '' } });
-        alert('Research started!');
+        showToast('Research started!', 'success');
     } catch (e) {
-        alert('Research failed: ' + e.message);
+        showToast('Research failed: ' + e.message, 'error');
     }
 }
 
@@ -685,9 +687,9 @@ async function loadProviders() {
 async function viewSecurityReport(taskId) {
     try {
         const data = await api('/security-report/' + taskId);
-        alert(data.report || 'No report available');
+        showToast(data.report ? 'Security report loaded' : 'No report available', 'info');
     } catch (e) {
-        alert('No security report found');
+        showToast('No security report found', 'warning');
     }
 }
 

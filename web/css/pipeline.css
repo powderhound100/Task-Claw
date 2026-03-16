@@ -128,7 +128,7 @@
 }
 
 .history-item .history-header:hover {
-    background: #1a2a4e;
+    background: var(--bg-elevated);
 }
 
 .history-item .history-header .run-title {
