@@ -8,3 +8,5 @@ pipeline-output/
 skill-output/
 __pycache__/
 *.pyc
+_pipeline_canary.txt
+task-claw-rs/target/
