@@ -75,6 +75,7 @@ If the PM returns REVISE, the stage is re-run with feedback (up to `PIPELINE_MAX
 - `python task-claw.py` — polling mode (monitors tasks.json / ideas.json)
 - `POST /trigger {"prompt": "..."}` — pipeline via HTTP
 - `POST /trigger` (no body) — wake the polling loop
+- `POST /agent/build {"prompt": "...", "wait": true}` — agent interface (sync or async with callbacks)
 
 **Threading model:** HTTP trigger server runs in a daemon thread. Research jobs each spawn their own daemon thread. Team members within a pipeline stage run in `ThreadPoolExecutor`. The main loop uses `threading.Event` for interruptible sleep. Shared state is guarded by `status_lock` and `research_lock`.
 
@@ -163,6 +164,18 @@ The agent exposes an HTTP server on `AGENT_TRIGGER_PORT` (default 8099):
 | `/api/skills/{id}/run` | POST | Execute a skill with `{"input":"..."}` |
 | `/api/skills/{id}/runs` | GET | List completed runs for a skill |
 | `/skill-output/{run_id}` | GET | View full output of a skill run |
+
+**Agent Interface** (`/agent/` namespace — optimised for programmatic use by external AI agents):
+| Endpoint | Method | Description |
+|---|---|---|
+| `/agent/build` | POST | Full pipeline run. `{prompt, wait?, callback_url?, provider?, timeout?}` |
+| `/agent/plan` | POST | Plan-only (no code/test/publish). `{prompt, wait?, callback_url?, provider?, timeout?}` |
+| `/agent/skill` | POST | Run a skill by name/ID. `{skill, input?, wait?, callback_url?, timeout?}` |
+| `/agent/capabilities` | GET | Self-describing: lists endpoints, providers, skills, capacity |
+| `/agent/queue` | GET | Running, queued, and recent jobs |
+| `/agent/jobs/{id}` | GET | Job status and result |
+
+When `wait=true`, the request blocks until the job completes (default timeout: 600s for build, 120s for plan, 300s for skill). If it times out, a `poll_url` is returned. When `wait=false` (default for build), the response returns immediately with a `poll_url`. An optional `callback_url` receives a POST with the result when the job finishes.
 
 ## Task / Idea JSON Schema
 
