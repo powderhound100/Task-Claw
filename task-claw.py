@@ -2079,6 +2079,10 @@ status_lock = threading.Lock()
 research_jobs: dict = {}
 research_lock = threading.Lock()
 
+# ── Agent job registry ────────────────────────────────────────────────────
+_agent_jobs: dict = {}          # job_id -> job state
+_agent_jobs_lock = threading.Lock()
+
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -2155,6 +2159,16 @@ class TriggerHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._check_auth():
             return
+
+        # ── Agent API (POST) ──────────────────────────────────────────
+        _p = self.path.rstrip("/")
+        if _p == "/agent/build":
+            return self._agent_build()
+        if _p == "/agent/plan":
+            return self._agent_plan()
+        if _p == "/agent/skill":
+            return self._agent_skill()
+
         if self.path.rstrip("/") == "/trigger":
             body = self._read_body()
             if body is None:
@@ -2387,6 +2401,16 @@ class TriggerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]  # strip query params
 
+        # ── Agent API (GET) ───────────────────────────────────────────
+        _ap = path.rstrip("/")
+        if _ap == "/agent/capabilities":
+            return self._agent_capabilities()
+        if _ap == "/agent/queue":
+            return self._agent_queue()
+        if _ap.startswith("/agent/jobs/"):
+            job_id = _ap.split("/agent/jobs/", 1)[1]
+            return self._agent_job_status(job_id)
+
         # ── Static file serving ─────────────────────────────────────────
         if path in ("/", "/index.html"):
             self._serve_file(WEB_DIR / "index.html", _WEB_DIR_RESOLVED)
@@ -2590,6 +2614,295 @@ class TriggerHandler(BaseHTTPRequestHandler):
                 saver(filtered)
         self._json(200, {"ok": True})
 
+    # ── Agent API handler methods ────────────────────────────────────────
+
+    def _agent_build(self):
+        body = self._read_body()
+        if body is None:
+            return
+        prompt = body.get("prompt")
+        if not prompt:
+            return self._json(400, {"ok": False, "error": "Missing 'prompt' field"})
+
+        wait = body.get("wait", False)
+        callback_url = body.get("callback_url")
+        provider = body.get("provider")
+        timeout = min(int(body.get("timeout", 600)), 1800)
+
+        job_id = f"aj-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        event = threading.Event()
+
+        with _agent_jobs_lock:
+            _agent_jobs[job_id] = {
+                "id": job_id, "type": "build", "status": "queued",
+                "prompt": prompt[:500],
+                "created": datetime.now(timezone.utc).isoformat(),
+                "completed_at": None, "callback_url": callback_url,
+                "result": None, "_event": event,
+            }
+
+        threading.Thread(target=_run_agent_job,
+                         args=(job_id, prompt, provider),
+                         daemon=True).start()
+
+        if wait:
+            event.wait(timeout=timeout)
+            with _agent_jobs_lock:
+                job = _agent_jobs.get(job_id, {})
+            if job.get("status") in ("completed", "failed"):
+                self._json(200, {"ok": True, "job_id": job_id,
+                                 "status": job["status"], "result": job["result"]})
+            else:
+                self._json(202, {"ok": True, "job_id": job_id,
+                                 "status": "running",
+                                 "message": "Timed out waiting; job still running",
+                                 "poll_url": f"/agent/jobs/{job_id}"})
+        else:
+            self._json(202, {"ok": True, "job_id": job_id,
+                             "status": "queued",
+                             "poll_url": f"/agent/jobs/{job_id}"})
+
+    def _agent_plan(self):
+        body = self._read_body()
+        if body is None:
+            return
+        prompt = body.get("prompt")
+        if not prompt:
+            return self._json(400, {"ok": False, "error": "Missing 'prompt' field"})
+
+        wait = body.get("wait", True)
+        callback_url = body.get("callback_url")
+        provider = body.get("provider")
+        timeout = min(int(body.get("timeout", 120)), 600)
+
+        # Build a plan-only pipeline config
+        cfg = load_pipeline()
+        for stage in ("code", "simplify", "test", "review"):
+            cfg.setdefault("stages", {}).setdefault(stage, {})["enabled"] = False
+        cfg.setdefault("publish", {})["enabled"] = False
+
+        job_id = f"ap-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        event = threading.Event()
+
+        with _agent_jobs_lock:
+            _agent_jobs[job_id] = {
+                "id": job_id, "type": "plan", "status": "queued",
+                "prompt": prompt[:500],
+                "created": datetime.now(timezone.utc).isoformat(),
+                "completed_at": None, "callback_url": callback_url,
+                "result": None, "_event": event,
+            }
+
+        threading.Thread(target=_run_agent_job,
+                         args=(job_id, prompt, provider, cfg),
+                         daemon=True).start()
+
+        if wait:
+            event.wait(timeout=timeout)
+            with _agent_jobs_lock:
+                job = _agent_jobs.get(job_id, {})
+            if job.get("status") in ("completed", "failed"):
+                self._json(200, {"ok": True, "job_id": job_id,
+                                 "status": job["status"], "result": job["result"]})
+            else:
+                self._json(202, {"ok": True, "job_id": job_id,
+                                 "status": "running",
+                                 "message": "Timed out waiting; job still running",
+                                 "poll_url": f"/agent/jobs/{job_id}"})
+        else:
+            self._json(202, {"ok": True, "job_id": job_id,
+                             "status": "queued",
+                             "poll_url": f"/agent/jobs/{job_id}"})
+
+    def _agent_skill(self):
+        body = self._read_body()
+        if body is None:
+            return
+        skill_ref = body.get("skill")
+        if not skill_ref:
+            return self._json(400, {"ok": False, "error": "Missing 'skill' field"})
+
+        all_skills = get_all_skills()
+        skill_id = None
+        if skill_ref in all_skills:
+            skill_id = skill_ref
+        else:
+            for sid, s in all_skills.items():
+                if s.get("name", "").lower() == skill_ref.lower():
+                    skill_id = sid
+                    break
+        if not skill_id:
+            return self._json(404, {
+                "ok": False, "error": f"Skill '{skill_ref}' not found",
+                "available_skills": [s.get("name", sid)
+                                     for sid, s in all_skills.items()]})
+
+        input_text = body.get("input", "")
+        wait = body.get("wait", True)
+        timeout = min(int(body.get("timeout", 300)), 1800)
+
+        job_id = f"as-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        event = threading.Event()
+
+        with _agent_jobs_lock:
+            _agent_jobs[job_id] = {
+                "id": job_id, "type": "skill", "status": "queued",
+                "prompt": f"skill:{skill_id} input:{input_text[:200]}",
+                "created": datetime.now(timezone.utc).isoformat(),
+                "completed_at": None, "callback_url": body.get("callback_url"),
+                "result": None, "_event": event,
+            }
+
+        def _run():
+            with _agent_jobs_lock:
+                j = _agent_jobs.get(job_id)
+                if j:
+                    j["status"] = "running"
+            try:
+                result = run_skill(skill_id, input_text, body.get("provider"))
+            except Exception as exc:
+                result = {"success": False, "output": str(exc),
+                          "run_id": "", "elapsed": 0}
+            agent_result = {
+                "success": result.get("success", False),
+                "output": result.get("output", ""),
+                "run_id": result.get("run_id", ""),
+                "elapsed_seconds": result.get("elapsed", 0),
+            }
+            with _agent_jobs_lock:
+                j = _agent_jobs.get(job_id)
+                if j:
+                    j["status"] = "completed" if result.get("success") else "failed"
+                    j["result"] = agent_result
+                    j["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    j["_event"].set()
+            if j:
+                _fire_agent_callback(j)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+        if wait:
+            event.wait(timeout=timeout)
+            with _agent_jobs_lock:
+                job = _agent_jobs.get(job_id, {})
+            if job.get("status") in ("completed", "failed"):
+                self._json(200, {"ok": True, "job_id": job_id,
+                                 "status": job["status"], "result": job["result"]})
+            else:
+                self._json(202, {"ok": True, "job_id": job_id,
+                                 "status": "running",
+                                 "poll_url": f"/agent/jobs/{job_id}"})
+        else:
+            self._json(202, {"ok": True, "job_id": job_id,
+                             "status": "queued",
+                             "poll_url": f"/agent/jobs/{job_id}"})
+
+    def _agent_capabilities(self):
+        providers_cfg = _load_providers()
+        all_skills = get_all_skills()
+        pipeline_cfg = load_pipeline()
+
+        self._json(200, {
+            "ok": True,
+            "version": AGENT_VERSION,
+            "endpoints": {
+                "POST /agent/build": {
+                    "description": "Submit a feature/task for full pipeline execution (rewrite, plan, code, test, review, publish)",
+                    "params": {
+                        "prompt": {"type": "string", "required": True, "description": "What to build"},
+                        "wait": {"type": "boolean", "default": False, "description": "Block until pipeline completes"},
+                        "callback_url": {"type": "string", "description": "URL to POST result when done"},
+                        "provider": {"type": "string", "description": "CLI provider override"},
+                        "timeout": {"type": "integer", "default": 600, "max": 1800, "description": "Max wait seconds (only if wait=true)"},
+                    },
+                },
+                "POST /agent/plan": {
+                    "description": "Plan only (no code/test/review/publish) — returns the plan for review",
+                    "params": {
+                        "prompt": {"type": "string", "required": True},
+                        "wait": {"type": "boolean", "default": True},
+                        "timeout": {"type": "integer", "default": 120, "max": 600},
+                    },
+                },
+                "POST /agent/skill": {
+                    "description": "Run a named skill through a CLI provider",
+                    "params": {
+                        "skill": {"type": "string", "required": True, "description": "Skill name or ID"},
+                        "input": {"type": "string", "default": "", "description": "Input text for the skill prompt"},
+                        "wait": {"type": "boolean", "default": True},
+                        "timeout": {"type": "integer", "default": 300, "max": 1800},
+                    },
+                },
+                "GET /agent/jobs/{id}": {
+                    "description": "Check job status and retrieve results",
+                },
+                "GET /agent/capabilities": {
+                    "description": "This endpoint — list available operations, providers, skills, capacity",
+                },
+                "GET /agent/queue": {
+                    "description": "View running, queued, and recent jobs",
+                },
+            },
+            "providers": list(providers_cfg.get("providers", {}).keys()),
+            "default_provider": os.environ.get("CLI_PROVIDER",
+                                providers_cfg.get("default_provider", "claude")),
+            "skills": [
+                {"id": sid, "name": s.get("name", sid),
+                 "description": s.get("description", "")}
+                for sid, s in all_skills.items()
+            ],
+            "capacity": {
+                "max_concurrent": 2,
+                "available_slots": _count_available_slots(),
+            },
+            "pipeline_stages": list(pipeline_cfg.get("stages", {}).keys()),
+        })
+
+    def _agent_queue(self):
+        with _agent_jobs_lock:
+            jobs = []
+            for jid, job in _agent_jobs.items():
+                jobs.append({
+                    "job_id": jid,
+                    "type": job.get("type", "build"),
+                    "status": job["status"],
+                    "prompt": job.get("prompt", ""),
+                    "created": job["created"],
+                    "completed_at": job.get("completed_at"),
+                })
+
+        running = [j for j in jobs if j["status"] == "running"]
+        queued = [j for j in jobs if j["status"] == "queued"]
+        recent = sorted(
+            [j for j in jobs if j["status"] in ("completed", "failed")],
+            key=lambda j: j.get("completed_at") or "", reverse=True
+        )[:20]
+
+        self._json(200, {
+            "ok": True,
+            "running": running,
+            "queued": queued,
+            "recent": recent,
+            "capacity": {"max_concurrent": 2,
+                         "available_slots": _count_available_slots()},
+        })
+
+    def _agent_job_status(self, job_id: str):
+        with _agent_jobs_lock:
+            job = _agent_jobs.get(job_id)
+        if not job:
+            return self._json(404, {"ok": False, "error": "Job not found"})
+        self._json(200, {
+            "ok": True,
+            "job_id": job["id"],
+            "type": job.get("type", "build"),
+            "status": job["status"],
+            "prompt": job.get("prompt", ""),
+            "created": job["created"],
+            "completed_at": job.get("completed_at"),
+            "result": job.get("result"),
+        })
+
     def _read_body(self) -> dict | None:
         try:
             cl = int(self.headers.get("Content-Length", 0))
@@ -2694,6 +3007,128 @@ def _safe_pipeline_thread(target, *args, task_id: str = "", task_coll=None,
                 pass
     finally:
         _pipeline_semaphore.release()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  AGENT INTERFACE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _distill_pipeline_result(raw: dict, job_id: str) -> dict:
+    """Transform raw pipeline result into agent-optimised structure."""
+    stages = []
+    for entry in raw.get("stage_log", []):
+        stages.append({
+            "name": entry.get("stage"),
+            "elapsed_seconds": round(entry.get("elapsed", 0), 1),
+            "verdict": entry.get("verdict"),
+            "issues": entry.get("issues", []),
+            "output_preview": (entry.get("note") or "")[:500],
+        })
+    return {
+        "success": raw.get("success", False),
+        "error": raw.get("error"),
+        "published": raw.get("published", False),
+        "elapsed_seconds": round(raw.get("pipeline_elapsed", 0), 1),
+        "stages": stages,
+        "outputs_url": f"/pipeline-output/{job_id}",
+        "stats": raw.get("stats", {}),
+    }
+
+
+def _fire_agent_callback(job: dict):
+    """POST result to the caller's callback URL (fire-and-forget)."""
+    url = job.get("callback_url")
+    if not url:
+        return
+    payload = {
+        "job_id": job["id"],
+        "status": job["status"],
+        "result": job.get("result"),
+        "completed_at": job.get("completed_at"),
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as exc:
+        log.warning("Agent callback failed for job %s: %s", job["id"], exc)
+
+
+def _cleanup_agent_jobs():
+    """Prune completed jobs beyond 100 entries."""
+    with _agent_jobs_lock:
+        completed = [(jid, j) for jid, j in _agent_jobs.items()
+                     if j["status"] in ("completed", "failed")]
+        if len(completed) > 100:
+            completed.sort(key=lambda x: x[1].get("completed_at", ""))
+            for jid, _ in completed[:-100]:
+                del _agent_jobs[jid]
+
+
+def _count_available_slots() -> int:
+    """Check how many pipeline slots are free."""
+    acquired = 0
+    for _ in range(2):
+        if _pipeline_semaphore.acquire(blocking=False):
+            acquired += 1
+        else:
+            break
+    for _ in range(acquired):
+        _pipeline_semaphore.release()
+    return acquired
+
+
+def _run_agent_job(job_id: str, prompt: str,
+                   provider: str | None = None,
+                   pipeline_cfg: dict | None = None):
+    """Run a pipeline for an agent job, capturing results and firing callbacks."""
+    _cleanup_agent_jobs()
+
+    with _agent_jobs_lock:
+        job = _agent_jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+
+    if not _pipeline_semaphore.acquire(blocking=False):
+        with _agent_jobs_lock:
+            job["status"] = "failed"
+            job["result"] = {"success": False, "error": "Pipeline at capacity",
+                             "published": False, "elapsed_seconds": 0,
+                             "stages": [], "outputs_url": None, "stats": {}}
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["_event"].set()
+        _fire_agent_callback(job)
+        return
+
+    old_provider = None
+    try:
+        if provider:
+            old_provider = os.environ.get("CLI_PROVIDER")
+            os.environ["CLI_PROVIDER"] = provider
+
+        result = run_pipeline(prompt, task_id=job_id,
+                              pipeline_cfg=pipeline_cfg)
+    except Exception as exc:
+        log.error("Agent job %s crashed: %s", job_id, exc, exc_info=True)
+        result = {"success": False, "error": str(exc), "stage_results": {},
+                  "stage_log": [], "published": False, "pipeline_elapsed": 0,
+                  "stats": {}}
+    finally:
+        _pipeline_semaphore.release()
+        if provider:
+            if old_provider is not None:
+                os.environ["CLI_PROVIDER"] = old_provider
+            else:
+                os.environ.pop("CLI_PROVIDER", None)
+
+    agent_result = _distill_pipeline_result(result, job_id)
+
+    with _agent_jobs_lock:
+        job["status"] = "completed" if result.get("success") else "failed"
+        job["result"] = agent_result
+        job["completed_at"] = datetime.now(timezone.utc).isoformat()
+        job["_event"].set()
+
+    _fire_agent_callback(job)
 
 
 def start_trigger_server():
