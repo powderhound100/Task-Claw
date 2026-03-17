@@ -271,6 +271,39 @@ class TestBuildCliCommand(unittest.TestCase):
         self.assertIn(str(fake_path), cmd)
         self.assertNotIn("{prompt_file}", " ".join(cmd))
 
+    def test_stdin_for_claude_strips_prompt(self):
+        """Claude prompts should be passed via stdin, not as command-line args."""
+        provider = self.providers["claude"]
+        prompt = "Fix **bold** and `code` formatting\nLine 2"
+        cmd = tc.build_cli_command(provider, "implement", prompt)
+        # Before _stdin_for_claude, prompt is in args
+        self.assertIn(prompt, cmd)
+        # After _stdin_for_claude, prompt is stripped and returned as stdin
+        cmd2, stdin_text = tc._stdin_for_claude(provider, cmd, prompt)
+        self.assertNotIn(prompt, cmd2)
+        self.assertEqual(stdin_text, prompt)
+        # -p flag is preserved
+        self.assertIn("-p", cmd2)
+
+    def test_stdin_for_non_claude_noop(self):
+        """Non-Claude providers should not use stdin passthrough."""
+        provider = self.providers["copilot"]
+        prompt = "Test prompt"
+        cmd = tc.build_cli_command(provider, "plan", prompt)
+        cmd2, stdin_text = tc._stdin_for_claude(provider, cmd, prompt)
+        self.assertEqual(cmd, cmd2)
+        self.assertIsNone(stdin_text)
+
+    def test_claude_long_prompt_no_prompt_file_flag(self):
+        """Claude should not use --prompt-file (it doesn't exist in Claude CLI)."""
+        provider = self.providers["claude"]
+        long_prompt = "x" * 7000
+        fake_file = Path("/tmp/test-prompt.md")
+        cmd = tc.build_cli_command(provider, "plan", long_prompt, prompt_file=fake_file)
+        self.assertNotIn("--prompt-file", cmd)
+        # -p flag should still be present
+        self.assertIn("-p", cmd)
+
 
 class TestGetProviderForPhase(unittest.TestCase):
     """Tests for get_provider_for_phase()."""

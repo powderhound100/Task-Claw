@@ -617,13 +617,20 @@ class TestPromptFileSwitching(E2EBase):
         self.assertIn("-p", cmd)
         self.assertNotIn("--prompt-file", cmd)
 
-    def test_long_prompt_uses_prompt_file(self):
+    def test_long_prompt_uses_stdin_for_claude(self):
+        """Claude uses stdin for prompts (no --prompt-file flag exists)."""
         long_prompt = "x" * 7000
         fake_file = Path("/tmp/test-prompt.md")
         cmd = tc.build_cli_command(self.providers["claude"], "plan", long_prompt,
                                     prompt_file=fake_file)
-        self.assertIn("--prompt-file", cmd)
-        self.assertIn(str(fake_file), cmd)
+        # Claude should NOT use --prompt-file (flag doesn't exist)
+        self.assertNotIn("--prompt-file", cmd)
+        # -p flag preserved
+        self.assertIn("-p", cmd)
+        # _stdin_for_claude strips the prompt for stdin passthrough
+        cmd2, stdin_text = tc._stdin_for_claude(self.providers["claude"], cmd, long_prompt)
+        self.assertNotIn(long_prompt, cmd2)
+        self.assertEqual(stdin_text, long_prompt)
 
     def test_aider_uses_message_file(self):
         long_prompt = "x" * 7000

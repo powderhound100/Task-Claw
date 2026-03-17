@@ -449,7 +449,9 @@ def _write_prompt_file(prompt: str, task_id: str, stage: str, phase: str) -> Pat
     return prompt_file
 
 
-_PROMPT_FILE_THRESHOLD = 6000  # chars — auto-switch to file-based prompt above this
+_PROMPT_FILE_THRESHOLD = 6000  # chars — for non-Claude CLIs, auto-switch to file-based prompt above this
+# NOTE: Claude prompts are ALWAYS passed via stdin (see _stdin_for_claude) to avoid
+# Windows cmd.exe mangling of special chars. This threshold only affects other CLIs.
 
 
 def build_cli_command(provider: dict, phase: str, prompt: str,
@@ -499,7 +501,9 @@ def build_cli_command(provider: dict, phase: str, prompt: str,
             if args[i] in ("-p", "--prompt", "--message") and i + 1 < len(args) and "{prompt}" in args[i + 1]:
                 # Replace with file-based flag for known CLIs
                 if bin_name == "claude":
-                    new_args.extend(["--prompt-file", str(prompt_file)])
+                    # Claude has no --prompt-file flag; keep -p flag, skip {prompt}
+                    # — run_cli_command passes the prompt via stdin instead.
+                    new_args.append(args[i])
                 elif bin_name == "aider":
                     new_args.extend(["--message-file", str(prompt_file)])
                 else:
@@ -742,11 +746,28 @@ def _warn_cli_prompt_size(stage: str, prompt: str, dynamic_len: int = 0):
                      stage, instruction_len, _CLI_PROMPT_WARN_CHARS)
 
 
+def _stdin_for_claude(provider: dict, cmd: list[str], prompt: str) -> tuple[list[str], str | None]:
+    """For Claude provider, strip prompt from args and return it as stdin text.
+
+    On Windows, claude.CMD goes through cmd.exe which mangles multi-line and
+    special-char arguments. Passing the prompt via stdin avoids this entirely.
+    Claude CLI accepts stdin input in print mode (-p flag).
+    """
+    is_claude = Path(provider.get("binary", "")).stem.lower() == "claude"
+    if is_claude and prompt:
+        cmd = [c for c in cmd if c != prompt]
+        return cmd, prompt
+    return cmd, None
+
+
 def run_cli_command(provider: dict, phase: str, prompt: str,
                     cwd: str | None = None,
                     prompt_file: Path | None = None) -> tuple[bool, str]:
     """Run a CLI provider command. Returns (success, output_text)."""
     cmd = build_cli_command(provider, phase, prompt, prompt_file=prompt_file)
+    # On Windows, cmd.exe mangles multi-line/special-char args for .cmd scripts.
+    # For Claude Code: pass prompt via stdin instead of positional arg.
+    cmd, stdin_text = _stdin_for_claude(provider, cmd, prompt)
     timeout = get_timeout(provider, phase)
     work_dir = cwd or str(PROJECT_DIR)
     # Fall back to agent dir if target dir doesn't exist
@@ -758,12 +779,14 @@ def run_cli_command(provider: dict, phase: str, prompt: str,
     cmd_display = []
     for c in cmd:
         cmd_display.append(c[:100] + "…" if len(c) > 100 else c)
-    log.info("   CLI [%s/%s]: %s (%s)",
-             provider.get("name", "?"), phase, " ".join(cmd_display), timeout_label)
+    log.info("   CLI [%s/%s]: %s (%s)%s",
+             provider.get("name", "?"), phase, " ".join(cmd_display), timeout_label,
+             " [stdin prompt]" if stdin_text else "")
     try:
         result = subprocess.run(
             cmd, cwd=work_dir,
             capture_output=True, text=True, timeout=timeout,
+            input=stdin_text,
             env=_clean_env(), encoding="utf-8", errors="replace",
         )
         log.info("   Exit code: %d | output: %d chars", result.returncode, len(result.stdout or ""))
@@ -3363,11 +3386,13 @@ def run_research(idea_id: str, title: str, description: str):
     try:
         provider = get_provider_for_phase("implement")
         cmd = build_cli_command(provider, "implement", prompt)
+        cmd, stdin_text = _stdin_for_claude(provider, cmd, prompt)
         timeout = get_timeout(provider, "implement")
 
         result = subprocess.run(
             cmd, cwd=str(PROJECT_DIR),
             capture_output=True, text=True, timeout=timeout,
+            input=stdin_text,
             env=_clean_env(), encoding="utf-8", errors="replace",
         )
         text = (output_file.read_text(encoding="utf-8") if output_file.exists()
@@ -3499,10 +3524,12 @@ def run_security_review(task_id: str, title: str) -> dict:
     try:
         provider = get_provider_for_phase("security")
         cmd = build_cli_command(provider, "security", review_prompt)
+        cmd, stdin_text = _stdin_for_claude(provider, cmd, review_prompt)
         timeout = get_timeout(provider, "security")
 
         result = subprocess.run(cmd, cwd=str(PROJECT_DIR),
                                 capture_output=True, text=True, timeout=timeout,
+                                input=stdin_text,
                                 env=_clean_env(), encoding="utf-8", errors="replace")
 
         log.info("🔒 Security review exit code: %d", result.returncode)
@@ -3604,9 +3631,11 @@ def _handle_security_findings(review: dict, task_id: str, title: str,
     try:
         provider = get_provider_for_phase("implement")
         cmd = build_cli_command(provider, "implement", fix_prompt)
+        cmd, stdin_text = _stdin_for_claude(provider, cmd, fix_prompt)
         timeout = get_timeout(provider, "implement")
         r = subprocess.run(cmd, cwd=str(PROJECT_DIR),
                            capture_output=True, text=True, timeout=timeout,
+                           input=stdin_text,
                            env=_clean_env(), encoding="utf-8", errors="replace")
         if r.returncode == 0:
             log.info("🔒✅ Security issues auto-fixed")
