@@ -59,6 +59,7 @@ _project_dir_setting = Path(os.environ.get("PROJECT_DIR", str(AGENT_DIR)))
 PROJECT_DIR   = _project_dir_setting if _project_dir_setting.is_dir() else AGENT_DIR
 DATA_DIR      = AGENT_DIR / "data"
 PHOTOS_DIR    = DATA_DIR / "photos"
+SECRETS_FILE  = DATA_DIR / "secrets.json"
 TASKS_FILE    = Path(os.environ.get("TASKS_FILE", str(DATA_DIR / "tasks.json")))
 IDEAS_FILE    = Path(os.environ.get("IDEAS_FILE", str(DATA_DIR / "ideas.json")))
 STATE_FILE    = AGENT_DIR / "agent-state.json"
@@ -806,10 +807,11 @@ def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict,
 
     # Build request params based on backend
     if backend == "github_models":
-        if not GITHUB_TOKEN:
+        gh_token = get_secret("GITHUB_TOKEN")
+        if not gh_token:
             raise ValueError("GITHUB_TOKEN not set")
         url = GITHUB_MODELS_URL
-        headers = {"Authorization": f"Bearer {GITHUB_TOKEN}",
+        headers = {"Authorization": f"Bearer {gh_token}",
                    "Content-Type": "application/json"}
         body = {"model": model, "temperature": temperature, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": system_msg},
@@ -817,7 +819,7 @@ def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict,
         extract = lambda r: r.json()["choices"][0]["message"]["content"]
 
     elif backend == "anthropic":
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = get_secret("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not set")
         url = "https://api.anthropic.com/v1/messages"
@@ -828,9 +830,8 @@ def _pm_api_call(system_msg: str, user_msg: str, pm_cfg: dict,
         extract = lambda r: r.json()["content"][0]["text"]
 
     elif backend == "openai_compatible":
-        url = os.environ.get("PIPELINE_PM_URL",
-                             "http://localhost:11434/v1/chat/completions")
-        key = os.environ.get("PIPELINE_PM_KEY") or os.environ.get("OPENAI_API_KEY", "")
+        url = get_secret("PIPELINE_PM_URL") or "http://localhost:11434/v1/chat/completions"
+        key = get_secret("PIPELINE_PM_KEY") or get_secret("OPENAI_API_KEY")
         headers = {"Authorization": f"Bearer {key}",
                    "Content-Type": "application/json"}
         body = {"model": model, "temperature": temperature, "max_tokens": max_tokens,
@@ -1441,8 +1442,11 @@ PIPELINE_WALLCLOCK_TIMEOUT = _env_int("PIPELINE_WALLCLOCK_TIMEOUT", 3600)  # sec
 def _pm_health_check(pm_cfg: dict) -> bool:
     """Quick check if PM backend config looks valid (no API call wasted)."""
     backend = pm_cfg.get("backend", "github_models")
-    if backend == "github_models" and not GITHUB_TOKEN:
+    if backend == "github_models" and not get_secret("GITHUB_TOKEN"):
         log.warning("⚠️ PM health check: no GITHUB_TOKEN set")
+        return False
+    if backend == "anthropic" and not get_secret("ANTHROPIC_API_KEY"):
+        log.warning("⚠️ PM health check: no ANTHROPIC_API_KEY set")
         return False
     return True
 
@@ -2342,6 +2346,25 @@ class TriggerHandler(BaseHTTPRequestHandler):
             PROVIDERS_FILE.write_text(json.dumps(body, indent=2), encoding="utf-8")
             self._json(200, {"ok": True})
 
+        elif self.path.rstrip("/") == "/api/secrets":
+            body = self._read_body()
+            if body is None:
+                return
+            if not isinstance(body, dict):
+                self._json(400, {"ok": False, "error": "Body must be a JSON object"})
+                return
+            secrets = load_secrets()
+            for key, value in body.items():
+                if key not in _ALLOWED_SECRET_KEYS:
+                    self._json(400, {"ok": False, "error": f"Key '{key}' not allowed"})
+                    return
+                if value:
+                    secrets[key] = value
+                else:
+                    secrets.pop(key, None)  # empty string = delete
+            save_secrets(secrets)
+            self._json(200, {"ok": True})
+
         elif self.path.startswith("/api/skills/"):
             skill_id = self.path.split("/api/skills/", 1)[1].rstrip("/")
             body = self._read_body()
@@ -2479,6 +2502,19 @@ class TriggerHandler(BaseHTTPRequestHandler):
 
         elif path.rstrip("/") == "/api/config/providers":
             self._json(200, _load_providers())
+
+        elif path.rstrip("/") == "/api/secrets":
+            # Return which keys are set (never expose values)
+            secrets = load_secrets()
+            status = {}
+            for key in _ALLOWED_SECRET_KEYS:
+                from_secrets = bool(secrets.get(key))
+                from_env = bool(os.environ.get(key))
+                status[key] = {
+                    "set": from_secrets or from_env,
+                    "source": "ui" if from_secrets else ("env" if from_env else "none"),
+                }
+            self._json(200, {"keys": status})
 
         elif path.rstrip("/") == "/api/skills":
             all_skills = get_all_skills()
@@ -3213,6 +3249,31 @@ def save_ideas(ideas: list):
     IDEAS_FILE.parent.mkdir(parents=True, exist_ok=True)
     IDEAS_FILE.write_text(json.dumps(ideas, indent=2), encoding="utf-8")
 
+# Valid secret keys the UI is allowed to set
+_ALLOWED_SECRET_KEYS = {"GITHUB_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                        "PIPELINE_PM_KEY", "PIPELINE_PM_URL"}
+
+def load_secrets() -> dict:
+    if not SECRETS_FILE.exists():
+        return {}
+    try:
+        return json.loads(SECRETS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("Could not read secrets file: %s", e)
+        return {}
+
+def save_secrets(secrets: dict):
+    SECRETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SECRETS_FILE.write_text(json.dumps(secrets, indent=2), encoding="utf-8")
+
+def get_secret(key: str) -> str:
+    """Get a secret, checking secrets.json first, then env vars."""
+    secrets = load_secrets()
+    val = secrets.get(key, "")
+    if val:
+        return val
+    return os.environ.get(key, "")
+
 
 # ── Status helpers ──────────────────────────────────────────────────────────
 def _update_task_status(task_id: str, tasks: list, status: str, note: str):
@@ -3244,7 +3305,8 @@ def _update_idea_status(idea_id: str, ideas: list, status: str, note: str):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def call_gpt4o(system_prompt: str, user_prompt: str, state: dict) -> str | None:
-    if not GITHUB_TOKEN:
+    gh_token = get_secret("GITHUB_TOKEN")
+    if not gh_token:
         log.error("GITHUB_TOKEN not set — cannot call GPT-4o")
         return None
     if state.get("api_calls_today", 0) >= MAX_API_CALLS_PER_DAY:
@@ -3253,7 +3315,7 @@ def call_gpt4o(system_prompt: str, user_prompt: str, state: dict) -> str | None:
     try:
         resp = requests.post(
             GITHUB_MODELS_URL,
-            headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {gh_token}", "Content-Type": "application/json"},
             json={
                 "model": GITHUB_MODELS_MODEL,
                 "messages": [
@@ -3867,7 +3929,8 @@ def main():
              f"{POLL_INTERVAL // 3600}h" if POLL_INTERVAL >= 3600 else f"{POLL_INTERVAL // 60}m")
     log.info("   API cap:      %d calls/day", MAX_API_CALLS_PER_DAY)
     log.info("   Trigger port: %d", TRIGGER_PORT)
-    log.info("   GitHub token: %s", "✅ set" if GITHUB_TOKEN else "❌ NOT SET")
+    log.info("   GitHub token: %s", "✅ set" if get_secret("GITHUB_TOKEN") else "❌ NOT SET")
+    log.info("   Anthropic key: %s", "✅ set" if get_secret("ANTHROPIC_API_KEY") else "❌ NOT SET")
 
     providers = list_available_providers()
     default = os.environ.get("CLI_PROVIDER", _load_providers().get("default_provider", "copilot"))
@@ -3876,7 +3939,7 @@ def main():
     log.info("")
 
     pm_backend = load_pipeline().get("program_manager", {}).get("backend", "github_models")
-    if pm_backend == "github_models" and not GITHUB_TOKEN:
+    if pm_backend == "github_models" and not get_secret("GITHUB_TOKEN"):
         log.warning("⚠️  GITHUB_TOKEN not set — PM backend 'github_models' will fail.")
         log.warning("   Set GITHUB_TOKEN in .env, or switch PM backend in pipeline.json")
         log.warning("   (options: 'anthropic', 'openai_compatible', or set PIPELINE_PM_URL for local)")

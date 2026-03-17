@@ -719,28 +719,80 @@ function renderProvidersSidebar() {
     el.innerHTML = html;
 }
 
+// Backend → model presets and required API key
+var BACKEND_PRESETS = {
+    github_models: {
+        label: 'GitHub Models',
+        models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'o3-mini'],
+        default_model: 'gpt-4o',
+        key_name: 'GITHUB_TOKEN',
+        key_label: 'GitHub Token',
+        key_placeholder: 'ghp_...'
+    },
+    anthropic: {
+        label: 'Anthropic',
+        models: ['claude-sonnet-4-20250514', 'claude-haiku-4-5-20251001', 'claude-opus-4-20250514'],
+        default_model: 'claude-sonnet-4-20250514',
+        key_name: 'ANTHROPIC_API_KEY',
+        key_label: 'Anthropic Key',
+        key_placeholder: 'sk-ant-...'
+    },
+    openai_compatible: {
+        label: 'OpenAI Compatible',
+        models: ['gpt-4o', 'gpt-4.1', 'llama3', 'mistral'],
+        default_model: 'gpt-4o',
+        key_name: 'PIPELINE_PM_KEY',
+        key_label: 'API Key',
+        key_placeholder: 'sk-...',
+        extra_keys: [
+            { name: 'PIPELINE_PM_URL', label: 'Endpoint URL', placeholder: 'http://localhost:11434/v1/chat/completions' }
+        ]
+    }
+};
+
+var _secretsStatus = {};
+
+function loadSecretsStatus() {
+    api('/api/secrets').then(function(data) {
+        _secretsStatus = data.keys || {};
+        if (pipelineConfig) renderPmConfig(pipelineConfig);
+    }).catch(function() {});
+}
+
 function renderPmConfig(cfg) {
     const el = document.getElementById('pmConfig');
     if (!el || !cfg.program_manager) return;
     const pm = cfg.program_manager;
+    const backend = pm.backend || 'github_models';
+    const preset = BACKEND_PRESETS[backend] || BACKEND_PRESETS.github_models;
 
     let html = '';
 
     // Backend selector
     html += '<div class="stage-config-field">';
     html += '<label>Backend</label>';
-    html += '<select class="inline-input" onchange="updatePmField(\'backend\', this.value)">';
-    ['github_models', 'anthropic', 'openai_compatible'].forEach(b => {
-        html += '<option value="' + b + '"' + (pm.backend === b ? ' selected' : '') + '>' + escHtml(b) + '</option>';
+    html += '<select class="inline-input" onchange="switchPmBackend(this.value)">';
+    Object.keys(BACKEND_PRESETS).forEach(function(b) {
+        html += '<option value="' + b + '"' + (backend === b ? ' selected' : '') + '>' + escHtml(BACKEND_PRESETS[b].label) + '</option>';
     });
     html += '</select>';
     html += '</div>';
 
-    // Model
+    // Model — dropdown with presets + custom option
     html += '<div class="stage-config-field">';
     html += '<label>Model</label>';
-    html += '<input type="text" class="inline-input" value="' + escHtml(pm.model || 'gpt-4o') + '" ';
-    html += 'onchange="updatePmField(\'model\', this.value)">';
+    var currentModel = pm.model || preset.default_model;
+    var isCustom = preset.models.indexOf(currentModel) === -1;
+    html += '<select class="inline-input" onchange="handleModelSelect(this.value)">';
+    preset.models.forEach(function(m) {
+        html += '<option value="' + m + '"' + (currentModel === m ? ' selected' : '') + '>' + escHtml(m) + '</option>';
+    });
+    html += '<option value="__custom__"' + (isCustom ? ' selected' : '') + '>Custom...</option>';
+    html += '</select>';
+    if (isCustom) {
+        html += '<input type="text" class="inline-input mt-4" value="' + escHtml(currentModel) + '" ';
+        html += 'placeholder="Model name" onchange="updatePmField(\'model\', this.value)">';
+    }
     html += '</div>';
 
     // Temperature
@@ -750,7 +802,101 @@ function renderPmConfig(cfg) {
     html += 'onchange="updatePmField(\'temperature\', parseFloat(this.value))">';
     html += '</div>';
 
+    // API Key section
+    html += '<div class="pe-divider"></div>';
+    html += '<div class="pe-group-label">API KEYS</div>';
+
+    // Primary key for this backend
+    var keyStatus = _secretsStatus[preset.key_name] || {};
+    html += _renderKeyField(preset.key_name, preset.key_label, preset.key_placeholder, keyStatus);
+
+    // Extra keys (e.g., URL for openai_compatible)
+    if (preset.extra_keys) {
+        preset.extra_keys.forEach(function(ek) {
+            var ekStatus = _secretsStatus[ek.name] || {};
+            html += _renderKeyField(ek.name, ek.label, ek.placeholder, ekStatus);
+        });
+    }
+
     el.innerHTML = html;
+}
+
+function _renderKeyField(keyName, label, placeholder, status) {
+    var isSet = status.set;
+    var source = status.source || 'none';
+    var dotClass = isSet ? 'key-dot-set' : 'key-dot-unset';
+    var sourceLabel = source === 'ui' ? 'saved' : (source === 'env' ? '.env' : 'not set');
+
+    var html = '<div class="stage-config-field key-field">';
+    html += '<label><span class="key-dot ' + dotClass + '"></span>' + escHtml(label) + ' <span class="text-muted text-sm">(' + sourceLabel + ')</span></label>';
+    html += '<div class="key-input-row">';
+    html += '<input type="password" class="inline-input key-input" id="key_' + keyName + '" ';
+    html += 'placeholder="' + (isSet ? '••••••••' : placeholder) + '">';
+    html += '<button class="btn btn-sm btn-key-save" onclick="saveApiKey(\'' + keyName + '\')">Set</button>';
+    html += '</div>';
+    if (isSet && source === 'ui') {
+        html += '<button class="btn-link text-sm text-muted" onclick="clearApiKey(\'' + keyName + '\')">Clear saved key</button>';
+    }
+    html += '</div>';
+    return html;
+}
+
+function switchPmBackend(backend) {
+    if (!pipelineConfig || !pipelineConfig.program_manager) return;
+    var preset = BACKEND_PRESETS[backend];
+    if (!preset) return;
+    pipelineConfig.program_manager.backend = backend;
+    pipelineConfig.program_manager.model = preset.default_model;
+    markPipelineDirty();
+    renderPmConfig(pipelineConfig);
+    // Update toolbar status text
+    renderPipelineStagesConfig(pipelineConfig);
+}
+
+function handleModelSelect(value) {
+    if (value === '__custom__') {
+        // Re-render to show custom input — set model to empty so user types it
+        if (pipelineConfig && pipelineConfig.program_manager) {
+            pipelineConfig.program_manager.model = '';
+            markPipelineDirty();
+            renderPmConfig(pipelineConfig);
+            // Focus the custom input
+            var inp = document.querySelector('#pmConfig .key-input, #pmConfig input[type="text"]');
+            if (inp) inp.focus();
+        }
+    } else {
+        updatePmField('model', value);
+    }
+}
+
+async function saveApiKey(keyName) {
+    var input = document.getElementById('key_' + keyName);
+    if (!input || !input.value.trim()) {
+        showToast('Enter a key value first', 'warning');
+        return;
+    }
+    try {
+        var body = {};
+        body[keyName] = input.value.trim();
+        await api('/api/secrets', { method: 'PUT', body: body });
+        input.value = '';
+        showToast(keyName + ' saved', 'success');
+        loadSecretsStatus();
+    } catch (e) {
+        showToast('Failed to save key: ' + e.message, 'error');
+    }
+}
+
+async function clearApiKey(keyName) {
+    try {
+        var body = {};
+        body[keyName] = '';
+        await api('/api/secrets', { method: 'PUT', body: body });
+        showToast(keyName + ' cleared', 'success');
+        loadSecretsStatus();
+    } catch (e) {
+        showToast('Failed to clear key: ' + e.message, 'error');
+    }
 }
 
 function toggleStage(name, enabled) {
@@ -776,6 +922,7 @@ function updatePmField(field, value) {
     if (!pipelineConfig || !pipelineConfig.program_manager) return;
     pipelineConfig.program_manager[field] = value;
     markPipelineDirty();
+    if (field === 'backend') renderPmConfig(pipelineConfig);
 }
 
 async function savePipelineConfig() {
@@ -856,6 +1003,7 @@ function startPolling() {
     fetchPipelineHistory();
     loadPipelineConfig();
     loadProvidersConfig();
+    loadSecretsStatus();
     renderTemplateMenu();
 
     // Close template menu when clicking outside
@@ -901,6 +1049,8 @@ async function fetchSkills() {
         renderSkillsList(skillsData);
     } catch (e) {
         console.warn('Skills fetch failed:', e);
+        const el = document.getElementById('skillsList');
+        if (el) el.innerHTML = emptyState('skills', 'Failed to load skills', 'Server may need a restart — ' + e.message);
     }
 }
 
