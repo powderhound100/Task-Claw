@@ -3875,7 +3875,7 @@ def main():
     log.info("   Default provider: %s", default)
     log.info("")
 
-    pm_backend = _load_pipeline_config().get("program_manager", {}).get("backend", "github_models")
+    pm_backend = load_pipeline().get("program_manager", {}).get("backend", "github_models")
     if pm_backend == "github_models" and not GITHUB_TOKEN:
         log.warning("⚠️  GITHUB_TOKEN not set — PM backend 'github_models' will fail.")
         log.warning("   Set GITHUB_TOKEN in .env, or switch PM backend in pipeline.json")
