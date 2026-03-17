@@ -17,6 +17,138 @@ const STAGE_DEFS = {
     publish:  { label: 'Publish',  color: '#22c55e', icon: '\uD83D\uDE80' }
 };
 let _selectedStage = null;
+let _templateMenuOpen = false;
+
+// -- Pipeline Templates --
+const PIPELINE_TEMPLATES = {
+    'fast-fix': {
+        label: 'Fast Fix',
+        description: 'Bug fixes: code + test only, no planning overhead',
+        stages: {
+            rewrite:  { enabled: false, team: ['claude'], timeout: 120 },
+            plan:     { enabled: false, team: ['claude'], timeout: 900 },
+            code:     { enabled: true,  team: ['claude'], timeout: 300 },
+            simplify: { enabled: false, team: ['claude'], timeout: 300 },
+            test:     { enabled: true,  team: ['claude'], timeout: 180 },
+            review:   { enabled: false, team: ['claude'], timeout: 300 }
+        }
+    },
+    'lightweight': {
+        label: 'Lightweight',
+        description: 'Small tasks: plan + code + test, no security review',
+        stages: {
+            rewrite:  { enabled: false, team: ['claude'], timeout: 120 },
+            plan:     { enabled: true,  team: ['claude'], timeout: 300 },
+            code:     { enabled: true,  team: ['claude'], timeout: 300 },
+            simplify: { enabled: false, team: ['claude'], timeout: 300 },
+            test:     { enabled: true,  team: ['claude'], timeout: 180 },
+            review:   { enabled: false, team: ['claude'], timeout: 300 }
+        }
+    },
+    'standard': {
+        label: 'Standard',
+        description: 'Default: full pipeline, single agent per stage',
+        stages: {
+            rewrite:  { enabled: true, team: ['claude'], timeout: 120 },
+            plan:     { enabled: true, team: ['claude'], timeout: 900 },
+            code:     { enabled: true, team: ['claude'], timeout: 600 },
+            simplify: { enabled: true, team: ['claude'], timeout: 300 },
+            test:     { enabled: true, team: ['claude'], timeout: 300 },
+            review:   { enabled: true, team: ['claude'], timeout: 300 }
+        }
+    },
+    'dual-parallel': {
+        label: 'Dual Parallel',
+        description: 'Complex features: 2 agents implement independently, cross-review + PM merge',
+        stages: {
+            rewrite:  { enabled: true, team: ['claude'],         timeout: 120 },
+            plan:     { enabled: true, team: ['claude', 'claude'], timeout: 900 },
+            code:     { enabled: true, team: ['claude', 'claude'], timeout: 900 },
+            simplify: { enabled: true, team: ['claude'],         timeout: 300 },
+            test:     { enabled: true, team: ['claude', 'claude'], timeout: 600 },
+            review:   { enabled: true, team: ['claude'],         timeout: 300 }
+        }
+    },
+    'full-swarm': {
+        label: 'Full Swarm',
+        description: 'Major features: 3-agent code swarm with full cross-review and dual test pass',
+        stages: {
+            rewrite:  { enabled: true, team: ['claude'],                   timeout: 120 },
+            plan:     { enabled: true, team: ['claude', 'claude'],           timeout: 900 },
+            code:     { enabled: true, team: ['claude', 'claude', 'claude'], timeout: 1200 },
+            simplify: { enabled: true, team: ['claude'],                   timeout: 300 },
+            test:     { enabled: true, team: ['claude', 'claude'],           timeout: 900 },
+            review:   { enabled: true, team: ['claude', 'claude'],           timeout: 600 }
+        }
+    },
+    'security-hardened': {
+        label: 'Security Hardened',
+        description: 'High-trust code: dual implementation with mandatory dual security review',
+        stages: {
+            rewrite:  { enabled: true, team: ['claude'],         timeout: 120 },
+            plan:     { enabled: true, team: ['claude'],         timeout: 900 },
+            code:     { enabled: true, team: ['claude', 'claude'], timeout: 900 },
+            simplify: { enabled: true, team: ['claude'],         timeout: 300 },
+            test:     { enabled: true, team: ['claude'],         timeout: 300 },
+            review:   { enabled: true, team: ['claude', 'claude'], timeout: 600 }
+        }
+    }
+};
+
+function applyTemplate(key) {
+    const tpl = PIPELINE_TEMPLATES[key];
+    if (!tpl || !pipelineConfig) return;
+    // Deep-merge stages: template stages override current config stages
+    Object.entries(tpl.stages).forEach(([name, stageCfg]) => {
+        if (!pipelineConfig.stages[name]) pipelineConfig.stages[name] = {};
+        Object.assign(pipelineConfig.stages[name], stageCfg);
+        // Preserve description if already set
+        if (pipelineConfig.stages[name].description === undefined && stageCfg.description) {
+            pipelineConfig.stages[name].description = stageCfg.description;
+        }
+    });
+    markPipelineDirty();
+    _selectedStage = null;
+    renderPipelineStagesConfig(pipelineConfig);
+    closeTemplateMenu();
+    showToast('Template applied: ' + tpl.label + '. Save to persist.', 'success');
+}
+
+function openTemplateMenu() {
+    const menu = document.getElementById('templateMenu');
+    if (!menu) return;
+    _templateMenuOpen = !_templateMenuOpen;
+    menu.style.display = _templateMenuOpen ? 'block' : 'none';
+}
+
+function closeTemplateMenu() {
+    _templateMenuOpen = false;
+    const menu = document.getElementById('templateMenu');
+    if (menu) menu.style.display = 'none';
+}
+
+function renderTemplateMenu() {
+    const menu = document.getElementById('templateMenu');
+    if (!menu) return;
+    let html = '';
+    Object.entries(PIPELINE_TEMPLATES).forEach(([key, tpl]) => {
+        const agentCounts = Object.entries(tpl.stages)
+            .filter(([, s]) => s.enabled)
+            .map(([n, s]) => {
+                const cnt = (s.team || []).length;
+                return cnt > 1 ? n + '\xD7' + cnt : null;
+            })
+            .filter(Boolean);
+        html += '<div class="template-item" onclick="applyTemplate(\'' + key + '\')">';
+        html += '<div class="template-label">' + escHtml(tpl.label) + '</div>';
+        html += '<div class="template-desc">' + escHtml(tpl.description) + '</div>';
+        if (agentCounts.length > 0) {
+            html += '<div class="template-tags">' + agentCounts.map(t => '<span class="template-tag">' + escHtml(t) + '</span>').join('') + '</div>';
+        }
+        html += '</div>';
+    });
+    menu.innerHTML = html;
+}
 
 // -- Agent Status + Pipeline Monitor --
 
@@ -724,6 +856,13 @@ function startPolling() {
     fetchPipelineHistory();
     loadPipelineConfig();
     loadProvidersConfig();
+    renderTemplateMenu();
+
+    // Close template menu when clicking outside
+    document.addEventListener('click', function(e) {
+        const picker = document.getElementById('templatePicker');
+        if (picker && !picker.contains(e.target)) closeTemplateMenu();
+    });
 
     // Poll status every 5s when pipeline is running, 30s otherwise
     let lastState = '';

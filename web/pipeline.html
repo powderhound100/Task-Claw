@@ -183,6 +183,10 @@
                             <span class="pe-status" id="peStatus"></span>
                         </div>
                         <div class="pe-toolbar-actions">
+                            <div class="template-picker" id="templatePicker">
+                                <button class="btn btn-secondary btn-sm" onclick="openTemplateMenu()" title="Load a pipeline template">Templates</button>
+                                <div class="template-menu" id="templateMenu" style="display:none"></div>
+                            </div>
                             <button class="btn btn-primary btn-sm" onclick="triggerPipelineRun()">&#9654; Run</button>
                             <button class="btn btn-secondary btn-sm" onclick="savePipelineConfig()">Save</button>
                             <button class="btn btn-secondary btn-sm" onclick="resetPipelineConfig()">Reset</button>
