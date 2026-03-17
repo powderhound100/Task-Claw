@@ -6,6 +6,18 @@ let pipelineConfig = null;
 let providersConfig = null;
 let statusPollTimer = null;
 
+// -- Visual Editor Stage Definitions --
+const STAGE_DEFS = {
+    rewrite:  { label: 'Rewrite',  color: '#a855f7', icon: '\u270F\uFE0F' },
+    plan:     { label: 'Plan',     color: '#6366f1', icon: '\uD83D\uDCCB' },
+    code:     { label: 'Code',     color: '#f59e0b', icon: '\u26A1' },
+    simplify: { label: 'Simplify', color: '#06b6d4', icon: '\uD83D\uDD27' },
+    test:     { label: 'Test',     color: '#3b82f6', icon: '\uD83E\uDDEA' },
+    review:   { label: 'Review',   color: '#ef4444', icon: '\uD83D\uDD12' },
+    publish:  { label: 'Publish',  color: '#22c55e', icon: '\uD83D\uDE80' }
+};
+let _selectedStage = null;
+
 // -- Agent Status + Pipeline Monitor --
 
 async function fetchStatus() {
@@ -403,50 +415,176 @@ function markPipelineDirty() {
 }
 
 function renderPipelineStagesConfig(cfg) {
-    const el = document.getElementById('pipelineStagesConfig');
+    renderStagePalette(cfg);
+    renderPipelineFlow(cfg);
+    renderPmConfig(cfg);
+    renderProvidersSidebar();
+    // Update status line
+    const statusEl = document.getElementById('peStatus');
+    if (statusEl) {
+        const enabled = Object.values(cfg.stages || {}).filter(s => s.enabled !== false).length;
+        statusEl.textContent = 'idle \u00B7 PM: ' + ((cfg.program_manager || {}).backend || 'github_models') +
+            ' \u00B7 ' + enabled + '/' + Object.keys(cfg.stages || {}).length + ' stages';
+    }
+    // Re-render properties if a stage is selected
+    if (_selectedStage) renderStageProperties(_selectedStage);
+}
+
+function renderStagePalette(cfg) {
+    const el = document.getElementById('peStagePalette');
     if (!el) return;
     const stages = cfg.stages || {};
-
     let html = '';
-    for (const [name, scfg] of Object.entries(stages)) {
+    PIPELINE_STAGES.forEach(function(name) {
+        const scfg = stages[name] || {};
+        const def = STAGE_DEFS[name] || {};
         const enabled = scfg.enabled !== false;
-        const team = (scfg.team || ['claude']).join(', ');
-        const timeout = scfg.timeout || 300;
+        const sel = _selectedStage === name ? ' selected' : '';
+        const dis = enabled ? '' : ' disabled-stage';
+        html += '<div class="pe-palette-item' + sel + dis + '" onclick="selectStage(\'' + name + '\')">';
+        html += '<div class="pe-palette-icon" style="background:' + (def.color || '#666') + '20;color:' + (def.color || '#666') + '">' + (def.icon || '\u25CF') + '</div>';
+        html += '<span class="pe-palette-name">' + escHtml(def.label || name) + '</span>';
+        if (enabled) html += '<span class="pe-palette-check">\u2713</span>';
+        html += '</div>';
+    });
+    el.innerHTML = html;
+}
 
-        html += '<div class="stage-config-row' + (enabled ? '' : ' disabled') + '" data-stage="' + escHtml(name) + '">';
-        html += '<div class="stage-config-name">' + escHtml(name) + '</div>';
+function renderPipelineFlow(cfg) {
+    const el = document.getElementById('peFlow');
+    if (!el) return;
+    const stages = cfg.stages || {};
+    let html = '';
+    var stageNames = Object.keys(stages);
+    stageNames.forEach(function(name, i) {
+        var scfg = stages[name] || {};
+        var def = STAGE_DEFS[name] || {};
+        var enabled = scfg.enabled !== false;
+        var team = (scfg.team || ['claude']).join(', ');
+        var timeout = scfg.timeout || 300;
+        var mins = Math.round(timeout / 60);
+        var sel = _selectedStage === name ? ' selected' : '';
+        var dis = enabled ? '' : ' disabled-node';
 
-        // Toggle switch
-        html += '<label class="toggle-switch">';
-        html += '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="toggleStage(\'' + escHtml(name) + '\', this.checked)">';
-        html += '<span class="toggle-slider"></span>';
-        html += '</label>';
-
-        // Team (editable)
-        html += '<div class="stage-config-field">';
-        html += '<label>Team</label>';
-        html += '<input type="text" class="inline-input" value="' + escHtml(team) + '" ';
-        html += 'onchange="updateStageField(\'' + escHtml(name) + '\', \'team\', this.value)" ';
-        html += 'placeholder="claude, copilot">';
+        html += '<div class="pe-node' + sel + dis + '" style="--node-color:' + (def.color || '#666') + ';border-color:' + (enabled ? (def.color || '#666') + '80' : 'var(--border)') + '" ';
+        html += 'onclick="selectStage(\'' + name + '\')" data-stage="' + name + '">';
+        html += '<div class="pe-node-icon" style="background:' + (def.color || '#666') + '20;color:' + (def.color || '#666') + '">' + (def.icon || '\u25CF') + '</div>';
+        html += '<div class="pe-node-info">';
+        html += '<div class="pe-node-name">' + escHtml(def.label || name) + '</div>';
+        html += '<div class="pe-node-meta">' + escHtml(team) + ' \u00B7 ' + mins + 'm</div>';
+        html += '</div>';
+        html += '<button class="pe-node-close" onclick="event.stopPropagation();toggleStageEnabled(\'' + name + '\')" title="' + (enabled ? 'Disable' : 'Enable') + '">';
+        html += enabled ? '\u00D7' : '+';
+        html += '</button>';
         html += '</div>';
 
-        // Timeout (editable)
-        html += '<div class="stage-config-field">';
-        html += '<label>Timeout</label>';
-        html += '<div class="timeout-input">';
-        html += '<input type="number" class="inline-input" value="' + timeout + '" min="30" max="3600" ';
-        html += 'onchange="updateStageField(\'' + escHtml(name) + '\', \'timeout\', parseInt(this.value))">';
-        html += '<span class="unit">s</span>';
-        html += '</div>';
-        html += '</div>';
+        if (i < stageNames.length - 1) {
+            html += '<div class="pe-connector"><div class="pe-connector-line"></div><div class="pe-connector-dot"></div></div>';
+        }
+    });
+    el.innerHTML = html;
+}
 
-        html += '</div>';
+function selectStage(name) {
+    _selectedStage = _selectedStage === name ? null : name;
+    if (pipelineConfig) {
+        renderStagePalette(pipelineConfig);
+        renderPipelineFlow(pipelineConfig);
+    }
+    if (_selectedStage) {
+        renderStageProperties(_selectedStage);
+    } else {
+        var el = document.getElementById('pePropsContent');
+        if (el) el.innerHTML = '<div class="pe-props-hint"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" style="width:32px;height:32px;color:var(--border);margin-bottom:8px"><circle cx="24" cy="24" r="16"/><path d="M24 16v8M24 28v2"/></svg><p class="text-muted text-sm">Select a stage to edit</p></div>';
+    }
+}
+
+function renderStageProperties(name) {
+    var el = document.getElementById('pePropsContent');
+    if (!el || !pipelineConfig || !pipelineConfig.stages[name]) return;
+    var scfg = pipelineConfig.stages[name];
+    var def = STAGE_DEFS[name] || {};
+    var enabled = scfg.enabled !== false;
+    var team = (scfg.team || ['claude']).join(', ');
+    var timeout = scfg.timeout || 300;
+
+    var html = '<div class="pe-props-header">';
+    html += '<div class="pe-props-icon" style="background:' + (def.color || '#666') + '20;color:' + (def.color || '#666') + '">' + (def.icon || '\u25CF') + '</div>';
+    html += '<span class="pe-props-name">' + escHtml(def.label || name) + '</span>';
+    html += '<button class="pe-props-delete" onclick="toggleStageEnabled(\'' + name + '\')">' + (enabled ? 'Disable' : 'Enable') + '</button>';
+    html += '</div>';
+
+    // Enabled toggle
+    html += '<div class="pe-props-field"><div class="toggle-row"><span class="toggle-label">Enabled</span>';
+    html += '<label class="toggle-switch"><input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="toggleStage(\'' + name + '\',this.checked);renderStageProperties(\'' + name + '\')"><span class="toggle-slider"></span></label>';
+    html += '</div></div>';
+
+    // Provider / Team
+    html += '<div class="pe-props-field"><label>PROVIDER</label>';
+    html += '<input type="text" class="inline-input" value="' + escHtml(team) + '" ';
+    html += 'onchange="updateStageField(\'' + name + '\',\'team\',this.value)" placeholder="claude, copilot"></div>';
+
+    // Timeout
+    html += '<div class="pe-props-field"><label>TIMEOUT (SECONDS)</label>';
+    html += '<input type="number" class="inline-input" value="' + timeout + '" min="30" max="3600" ';
+    html += 'onchange="updateStageField(\'' + name + '\',\'timeout\',parseInt(this.value))"></div>';
+
+    // Team size info
+    var teamArr = (scfg.team || ['claude']);
+    html += '<div class="pe-props-field"><label>TEAM SIZE</label>';
+    html += '<div style="font-size:0.85rem;color:var(--text)">' + teamArr.length + ' agent' + (teamArr.length !== 1 ? 's' : '') + '</div></div>';
+
+    // Stage-specific notes
+    if (name === 'code') {
+        html += '<div class="pe-props-field"><label>NOTES</label>';
+        html += '<div style="font-size:0.78rem;color:var(--text-muted)">Multi-agent: when 2+ agents are assigned, they implement independently and cross-review.</div></div>';
+    } else if (name === 'review') {
+        html += '<div class="pe-props-field"><label>NOTES</label>';
+        html += '<div style="font-size:0.78rem;color:var(--text-muted)">Security audit. HIGH severity findings block publish.</div></div>';
+    } else if (name === 'publish') {
+        html += '<div class="pe-props-field"><label>NOTES</label>';
+        html += '<div style="font-size:0.78rem;color:var(--text-muted)">Git commit + push. Blocked if tests fail or security review finds HIGH severity.</div></div>';
     }
 
     el.innerHTML = html;
+}
 
-    // PM config
-    renderPmConfig(cfg);
+function toggleStageEnabled(name) {
+    if (!pipelineConfig || !pipelineConfig.stages[name]) return;
+    var enabled = pipelineConfig.stages[name].enabled !== false;
+    pipelineConfig.stages[name].enabled = !enabled;
+    markPipelineDirty();
+    renderPipelineStagesConfig(pipelineConfig);
+}
+
+function triggerPipelineRun() {
+    api('/trigger', { method: 'POST', body: {} }).then(function() {
+        showToast('Pipeline triggered!', 'success');
+    }).catch(function(e) {
+        showToast('Trigger failed: ' + e.message, 'error');
+    });
+}
+
+function renderProvidersSidebar() {
+    var el = document.getElementById('providerList');
+    if (!el || !providersConfig) return;
+    var providers = (providersConfig || {}).providers || {};
+    var keys = Object.keys(providers);
+    if (keys.length === 0) {
+        el.innerHTML = '<div class="text-muted text-sm">None configured</div>';
+        return;
+    }
+    var colors = ['#3b82f6', '#f59e0b', '#22c55e', '#a855f7', '#ef4444', '#06b6d4'];
+    var html = '';
+    keys.forEach(function(key, i) {
+        var p = providers[key];
+        html += '<div class="pe-provider-item">';
+        html += '<div class="pe-provider-dot" style="background:' + colors[i % colors.length] + '"></div>';
+        html += '<span class="pe-provider-name">' + escHtml(p.name || key) + '</span>';
+        html += '<span class="pe-provider-binary">' + escHtml(p.binary || '?') + '</span>';
+        html += '</div>';
+    });
+    el.innerHTML = html;
 }
 
 function renderPmConfig(cfg) {
@@ -454,7 +592,7 @@ function renderPmConfig(cfg) {
     if (!el || !cfg.program_manager) return;
     const pm = cfg.program_manager;
 
-    let html = '<div class="pm-config-grid">';
+    let html = '';
 
     // Backend selector
     html += '<div class="stage-config-field">';
@@ -473,30 +611,21 @@ function renderPmConfig(cfg) {
     html += 'onchange="updatePmField(\'model\', this.value)">';
     html += '</div>';
 
-    // Max tokens
-    html += '<div class="stage-config-field">';
-    html += '<label>Max Tokens</label>';
-    html += '<input type="number" class="inline-input" value="' + (pm.max_tokens || 4096) + '" ';
-    html += 'onchange="updatePmField(\'max_tokens\', parseInt(this.value))">';
-    html += '</div>';
-
     // Temperature
     html += '<div class="stage-config-field">';
-    html += '<label>Temperature</label>';
+    html += '<label>Temp</label>';
     html += '<input type="number" class="inline-input" value="' + (pm.temperature || 0.3) + '" step="0.1" min="0" max="2" ';
     html += 'onchange="updatePmField(\'temperature\', parseFloat(this.value))">';
     html += '</div>';
 
-    html += '</div>';
     el.innerHTML = html;
 }
 
 function toggleStage(name, enabled) {
     if (!pipelineConfig || !pipelineConfig.stages[name]) return;
     pipelineConfig.stages[name].enabled = enabled;
-    const row = document.querySelector('.stage-config-row[data-stage="' + name + '"]');
-    if (row) row.classList.toggle('disabled', !enabled);
     markPipelineDirty();
+    renderPipelineStagesConfig(pipelineConfig);
 }
 
 function updateStageField(name, field, value) {
@@ -507,6 +636,8 @@ function updateStageField(name, field, value) {
         pipelineConfig.stages[name][field] = value;
     }
     markPipelineDirty();
+    // Refresh flow nodes to show updated meta
+    renderPipelineFlow(pipelineConfig);
 }
 
 function updatePmField(field, value) {
@@ -537,25 +668,9 @@ function resetPipelineConfig() {
 }
 
 function renderProviderList(cfg) {
-    const el = document.getElementById('providerList');
-    if (!el) return;
-    const providers = cfg.providers || {};
-    if (Object.keys(providers).length === 0) {
-        el.innerHTML = emptyState('providers', 'No providers configured', 'Add providers in providers.json');
-        return;
-    }
-    let html = '<div class="grid-3">';
-    for (const [key, p] of Object.entries(providers)) {
-        html += '<div class="card provider-card">';
-        html += '<h4>' + escHtml(p.name || key) + '</h4>';
-        html += '<div class="text-sm text-muted">Binary: ' + escHtml(p.binary || '?') + '</div>';
-        const phases = ['plan', 'implement', 'simplify', 'test', 'security', 'review']
-            .filter(ph => p[ph + '_args']);
-        html += '<div class="text-sm mt-8">Phases: ' + (phases.length ? escHtml(phases.join(', ')) : 'default') + '</div>';
-        html += '</div>';
-    }
-    html += '</div>';
-    el.innerHTML = html;
+    // Providers are now rendered in the sidebar via renderProvidersSidebar
+    providersConfig = cfg;
+    renderProvidersSidebar();
 }
 
 function showConfigTab(tab, evt) {

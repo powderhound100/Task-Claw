@@ -153,31 +153,64 @@
             </div>
         </section>
 
-        <!-- Pipeline Configuration (Interactive) -->
+        <!-- Visual Pipeline Editor -->
         <section class="pipeline-section">
-            <h2>Pipeline Stages</h2>
-            <div class="card config-section">
-                <div id="pipelineStagesConfig" class="stages-editor"></div>
-                <div class="config-save-bar" id="pipelineSaveBar" style="display:none">
-                    <span class="unsaved-label">Unsaved changes</span>
-                    <button class="btn btn-secondary btn-sm" onclick="resetPipelineConfig()">Discard</button>
-                    <button class="btn btn-primary btn-sm" onclick="savePipelineConfig()">Save</button>
+            <div class="pe-editor">
+                <!-- Left sidebar -->
+                <aside class="pe-sidebar">
+                    <div class="pe-group">
+                        <div class="pe-group-label">PIPELINE</div>
+                        <div id="peStagePalette"></div>
+                    </div>
+                    <div class="pe-divider"></div>
+                    <div class="pe-group">
+                        <div class="pe-group-label">PM</div>
+                        <div id="pmConfig" class="pe-pm-config"></div>
+                    </div>
+                    <div class="pe-divider"></div>
+                    <div class="pe-group">
+                        <div class="pe-group-label">PROVIDERS</div>
+                        <div id="providerList" class="pe-provider-list"></div>
+                    </div>
+                </aside>
+
+                <!-- Center canvas -->
+                <div class="pe-canvas">
+                    <div class="pe-toolbar">
+                        <div class="pe-toolbar-left">
+                            <svg class="pe-toolbar-icon" viewBox="0 0 32 32" fill="none"><path d="M8 4c0 0-2 8 2 14M16 2c0 0-1 9 1 16M24 4c0 0 2 8-2 14" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><path d="M6 18c3 5 8 8 10 10 2-2 7-5 10-10" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
+                            <span class="pe-toolbar-title">Pipeline Editor</span>
+                            <span class="pe-status" id="peStatus"></span>
+                        </div>
+                        <div class="pe-toolbar-actions">
+                            <button class="btn btn-primary btn-sm" onclick="triggerPipelineRun()">&#9654; Run</button>
+                            <button class="btn btn-secondary btn-sm" onclick="savePipelineConfig()">Save</button>
+                            <button class="btn btn-secondary btn-sm" onclick="resetPipelineConfig()">Reset</button>
+                        </div>
+                    </div>
+                    <div class="pe-flow-container">
+                        <div class="pe-flow" id="peFlow">
+                            <!-- nodes rendered by JS -->
+                        </div>
+                    </div>
+                    <div class="config-save-bar" id="pipelineSaveBar" style="display:none">
+                        <span class="unsaved-label">Unsaved changes</span>
+                        <button class="btn btn-secondary btn-sm" onclick="resetPipelineConfig()">Discard</button>
+                        <button class="btn btn-primary btn-sm" onclick="savePipelineConfig()">Save</button>
+                    </div>
+                </div>
+
+                <!-- Right properties panel -->
+                <div class="pe-properties" id="peProperties">
+                    <div class="pe-group-label">PROPERTIES</div>
+                    <div id="pePropsContent">
+                        <div class="pe-props-hint">
+                            <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" style="width:32px;height:32px;color:var(--border);margin-bottom:8px"><circle cx="24" cy="24" r="16"/><path d="M24 16v8M24 28v2"/></svg>
+                            <p class="text-muted text-sm">Select a stage to edit</p>
+                        </div>
+                    </div>
                 </div>
             </div>
-        </section>
-
-        <!-- PM Configuration -->
-        <section class="pipeline-section">
-            <h2>Program Manager</h2>
-            <div class="card config-section">
-                <div id="pmConfig" class="pm-editor"></div>
-            </div>
-        </section>
-
-        <!-- Providers -->
-        <section class="pipeline-section">
-            <h2>Providers</h2>
-            <div id="providerList" class="provider-list"></div>
         </section>
 
         <!-- Raw Config Editor (Advanced) -->
